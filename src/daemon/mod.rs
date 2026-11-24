@@ -15,8 +15,8 @@ use crate::json_codec;
 use crate::paths;
 use crate::query::api::{self, ApiError};
 use crate::query::views;
+use crate::timeutil;
 use auth::{ApiToken, UNAUTHORIZED_MESSAGE};
-use chrono::Local;
 use http::{HttpRequest, LoopbackListener};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -47,7 +47,7 @@ static SIGNAL_INSTALLED: AtomicBool = AtomicBool::new(false);
 static LOG_STATE: Mutex<Option<(Option<OsString>, PathBuf)>> = Mutex::new(None);
 
 pub(crate) fn log_line(to_file: bool, level: &str, msg: &str) {
-    let ts = Local::now().format("%Y-%m-%d %H:%M:%S,%3f");
+    let ts = timeutil::local_now().strftime("%Y-%m-%d %H:%M:%S,%3f");
     let line = format!("{ts} {level} teamscli.daemon: {msg}\n");
     if to_file {
         let mut state = LOG_STATE.lock().unwrap_or_else(|p| p.into_inner());

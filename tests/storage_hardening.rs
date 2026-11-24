@@ -1,7 +1,9 @@
 mod common;
 
-use chrono::{FixedOffset, Local, NaiveDate, TimeZone, Utc};
 use common::*;
+use jiff::civil::{date, DateTime};
+use jiff::tz::{Offset, TimeZone};
+use jiff::ZonedDateTime;
 use rusqlite::{params, Connection};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -454,11 +456,23 @@ fn with_tz<T>(tz: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
-    Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp_millis()
+fn utc_ms(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> i64 {
+    DateTime::new(y, mo, d, h, mi, 0, 0)
+        .unwrap()
+        .to_zoned_datetime(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+        .as_millisecond()
 }
 
-fn when(v: &str, end: bool, now: chrono::DateTime<Local>) -> i64 {
+fn local_zoned(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> ZonedDateTime {
+    DateTime::new(y, mo, d, h, mi, 0, 0)
+        .unwrap()
+        .to_zoned_datetime(timeutil::local_tz())
+        .unwrap()
+}
+
+fn when(v: &str, end: bool, now: &ZonedDateTime) -> i64 {
     timeutil::parse_when_at(Some(v), end, now).unwrap().unwrap()
 }
 
@@ -468,14 +482,14 @@ fn today_and_yesterday_follow_calendar_days_across_spring_forward() {
         return;
     }
     with_tz("America/New_York", || {
-        let now = Local.with_ymd_and_hms(2026, 3, 9, 12, 0, 0).single().unwrap();
-        assert_eq!(when("yesterday", false, now), utc_ms(2026, 3, 8, 5, 0));
-        assert_eq!(when("yesterday", true, now), utc_ms(2026, 3, 9, 4, 0));
-        assert_eq!(when("today", false, now), utc_ms(2026, 3, 9, 4, 0));
-        assert_eq!(when("today", true, now), utc_ms(2026, 3, 10, 4, 0));
-        let on_dst_day = Local.with_ymd_and_hms(2026, 3, 8, 20, 0, 0).single().unwrap();
+        let now = local_zoned(2026, 3, 9, 12, 0);
+        assert_eq!(when("yesterday", false, &now), utc_ms(2026, 3, 8, 5, 0));
+        assert_eq!(when("yesterday", true, &now), utc_ms(2026, 3, 9, 4, 0));
+        assert_eq!(when("today", false, &now), utc_ms(2026, 3, 9, 4, 0));
+        assert_eq!(when("today", true, &now), utc_ms(2026, 3, 10, 4, 0));
+        let on_dst_day = local_zoned(2026, 3, 8, 20, 0);
         assert_eq!(
-            when("today", true, on_dst_day) - when("today", false, on_dst_day),
+            when("today", true, &on_dst_day) - when("today", false, &on_dst_day),
             23 * 3_600_000
         );
     });
@@ -487,14 +501,14 @@ fn today_and_yesterday_follow_calendar_days_across_fall_back() {
         return;
     }
     with_tz("America/New_York", || {
-        let now = Local.with_ymd_and_hms(2026, 11, 2, 9, 30, 0).single().unwrap();
-        assert_eq!(when("yesterday", false, now), utc_ms(2026, 11, 1, 4, 0));
-        assert_eq!(when("yesterday", true, now), utc_ms(2026, 11, 2, 5, 0));
+        let now = local_zoned(2026, 11, 2, 9, 30);
+        assert_eq!(when("yesterday", false, &now), utc_ms(2026, 11, 1, 4, 0));
+        assert_eq!(when("yesterday", true, &now), utc_ms(2026, 11, 2, 5, 0));
         assert_eq!(
-            when("yesterday", true, now) - when("yesterday", false, now),
+            when("yesterday", true, &now) - when("yesterday", false, &now),
             25 * 3_600_000
         );
-        assert_eq!(when("2026-11-01", true, now), when("today", false, now));
+        assert_eq!(when("2026-11-01", true, &now), when("today", false, &now));
     });
 }
 
@@ -505,23 +519,20 @@ fn bare_date_in_a_midnight_dst_gap_resolves_to_first_valid_instant() {
     }
     with_tz("America/Santiago", || {
         let first = utc_ms(2026, 9, 6, 4, 0);
-        let now = Local.with_ymd_and_hms(2026, 9, 6, 10, 0, 0).single().unwrap();
-        assert_eq!(when("2026-09-06", false, now), first);
-        assert_eq!(when("2026-09-05", true, now), first);
-        assert_eq!(when("today", false, now), first);
-        let next_day = Local.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).single().unwrap();
-        assert_eq!(when("yesterday", false, next_day), first);
-        assert_eq!(
-            timeutil::local_midnight_ms(NaiveDate::from_ymd_opt(2026, 9, 6).unwrap()),
-            Some(first)
-        );
+        let now = local_zoned(2026, 9, 6, 10, 0);
+        assert_eq!(when("2026-09-06", false, &now), first);
+        assert_eq!(when("2026-09-05", true, &now), first);
+        assert_eq!(when("today", false, &now), first);
+        let next_day = local_zoned(2026, 9, 7, 10, 0);
+        assert_eq!(when("yesterday", false, &next_day), first);
+        assert_eq!(timeutil::local_midnight_ms(date(2026, 9, 6)), Some(first));
     });
 }
 
 #[test]
 fn first_valid_local_ms_is_midnight_when_it_exists() {
-    let tz = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
-    let d = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+    let tz = TimeZone::fixed(Offset::from_seconds(5 * 3600 + 1800).unwrap());
+    let d = date(2026, 11, 1);
     assert_eq!(
         timeutil::first_valid_local_ms(&tz, d),
         Some(utc_ms(2026, 10, 31, 18, 30))

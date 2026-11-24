@@ -1,6 +1,9 @@
 use crate::formatters::Quoted;
 use crate::identity;
-use chrono::{DateTime, Days, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use jiff::civil::{Date, DateTime};
+use jiff::fmt::strtime;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ZonedDateTime};
 use regex::Regex;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -11,19 +14,41 @@ static DATE_ONLY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}-\d{2
 static ISO_FRAC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\.\d{6})\d+").unwrap());
 static NUM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+(\.\d+)?$").unwrap());
 
+pub fn local_tz() -> TimeZone {
+    if let Ok(tz) = std::env::var("TZ") {
+        let trimmed = tz.trim().trim_start_matches(':');
+        if trimmed == "UTC" || trimmed == "GMT" || trimmed == "Etc/UTC" {
+            return TimeZone::UTC;
+        }
+        if !trimmed.is_empty() {
+            if let Ok(z) = TimeZone::get(trimmed) {
+                return z;
+            }
+            if let Ok(z) = TimeZone::posix(trimmed) {
+                return z;
+            }
+        }
+    }
+    TimeZone::system()
+}
+
+pub fn local_now() -> ZonedDateTime {
+    Timestamp::now().to_zoned_datetime(local_tz())
+}
+
 pub fn now_ms() -> i64 {
-    Utc::now().timestamp_millis()
+    Timestamp::now().as_millisecond()
 }
 
 pub fn parse_when(value: Option<&str>, end: bool) -> Result<Option<i64>, String> {
-    parse_when_at(value, end, Local::now())
+    parse_when_at(value, end, &local_now())
 }
 
 pub fn parse_expiry(value: Option<&str>) -> Result<Option<i64>, String> {
-    parse_expiry_at(value, Local::now())
+    parse_expiry_at(value, &local_now())
 }
 
-pub fn parse_expiry_at(value: Option<&str>, now: DateTime<Local>) -> Result<Option<i64>, String> {
+pub fn parse_expiry_at(value: Option<&str>, now: &ZonedDateTime) -> Result<Option<i64>, String> {
     const MAX_EXPIRY_MS: i64 = 100 * 365 * 86_400 * 1000;
     let Some(raw) = value else {
         return Ok(None);
@@ -32,7 +57,7 @@ pub fn parse_expiry_at(value: Option<&str>, now: DateTime<Local>) -> Result<Opti
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("never") {
         return Ok(None);
     }
-    let now_ms = now.timestamp_millis();
+    let now_ms = now.timestamp().as_millisecond();
     let ts = if let Some(caps) = EXPIRY_REL_RE.captures(trimmed) {
         let n: i64 = caps[1].parse().map_err(|_| bad_expiry_msg(raw))?;
         if n <= 0 {
@@ -72,7 +97,7 @@ fn bad_expiry_msg(value: &str) -> String {
     )
 }
 
-pub fn parse_when_at(value: Option<&str>, end: bool, now: DateTime<Local>) -> Result<Option<i64>, String> {
+pub fn parse_when_at(value: Option<&str>, end: bool, now: &ZonedDateTime) -> Result<Option<i64>, String> {
     let Some(raw) = value else {
         return Ok(None);
     };
@@ -95,20 +120,21 @@ pub fn parse_when_at(value: Option<&str>, end: bool, now: DateTime<Local>) -> Re
             .and_then(|s| s.checked_mul(1000))
             .ok_or_else(|| bad_time_msg(raw))?;
         let ts = now
-            .timestamp_millis()
+            .timestamp()
+            .as_millisecond()
             .checked_sub(delta_ms)
             .ok_or_else(|| bad_time_msg(raw))?;
         return Ok(Some(ts));
     }
     if v == "today" || v == "yesterday" {
-        let mut day = now.date_naive();
+        let mut day = now.date();
         if v == "yesterday" {
-            day = day.checked_sub_days(Days::new(1)).ok_or_else(|| bad_time_msg(raw))?;
+            day = day.yesterday().map_err(|_| bad_time_msg(raw))?;
         }
         if end {
-            day = day.checked_add_days(Days::new(1)).ok_or_else(|| bad_time_msg(raw))?;
+            day = day.tomorrow().map_err(|_| bad_time_msg(raw))?;
         }
-        let ms = local_midnight_ms(day).ok_or_else(|| bad_time_msg(raw))?;
+        let ms = first_valid_local_ms(now.time_zone(), day).ok_or_else(|| bad_time_msg(raw))?;
         return Ok(Some(ms));
     }
     if v.len() >= 12 && v.chars().all(|c| c.is_ascii_digit()) {
@@ -126,39 +152,38 @@ pub fn parse_when_at(value: Option<&str>, end: bool, now: DateTime<Local>) -> Re
         return Ok(Some(ms));
     }
     if DATE_ONLY_RE.is_match(trimmed) {
-        if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-            let day = if end { d.checked_add_days(Days::new(1)) } else { Some(d) };
-            if let Some(ms) = day.and_then(local_midnight_ms) {
+        if let Ok(d) = trimmed.parse::<Date>() {
+            let day = if end { d.tomorrow().ok() } else { Some(d) };
+            if let Some(ms) = day.and_then(|day| first_valid_local_ms(now.time_zone(), day)) {
                 return Ok(Some(ms));
             }
         }
     }
-    for fmt in &[
+    for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M",
     ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            if let Some(local_dt) = Local.from_local_datetime(&ndt).earliest() {
-                return Ok(Some(local_dt.timestamp_millis()));
+        if let Ok(ndt) = strtime::parse(fmt, trimmed).and_then(|tm| tm.to_datetime()) {
+            if let Ok(z) = now.time_zone().to_ambiguous_zoned_datetime(ndt).compatible() {
+                return Ok(Some(z.timestamp().as_millisecond()));
             }
         }
     }
     Err(bad_time_msg(raw))
 }
 
-pub fn local_midnight_ms(day: NaiveDate) -> Option<i64> {
-    first_valid_local_ms(&Local, day)
+pub fn local_midnight_ms(day: Date) -> Option<i64> {
+    first_valid_local_ms(&local_tz(), day)
 }
 
-pub fn first_valid_local_ms<Tz: TimeZone>(tz: &Tz, day: NaiveDate) -> Option<i64> {
-    let midnight = day.and_hms_opt(0, 0, 0)?;
-    (0..=120).find_map(|min| {
-        tz.from_local_datetime(&(midnight + Duration::minutes(min)))
-            .earliest()
-            .map(|dt| dt.timestamp_millis())
-    })
+pub fn first_valid_local_ms(tz: &TimeZone, day: Date) -> Option<i64> {
+    let midnight = day.at(0, 0, 0, 0);
+    tz.to_ambiguous_zoned_datetime(midnight)
+        .compatible()
+        .ok()
+        .map(|z| z.timestamp().as_millisecond())
 }
 
 fn bad_time_msg(value: &str) -> String {
@@ -169,10 +194,10 @@ fn bad_time_msg(value: &str) -> String {
 }
 
 fn parse_iso_with_offset(s: &str) -> Option<i64> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp_millis());
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Some(ts.as_millisecond());
     }
-    for fmt in &[
+    for fmt in [
         "%Y-%m-%dT%H:%M%:z",
         "%Y-%m-%d %H:%M%:z",
         "%Y-%m-%dT%H:%M:%S%.f%z",
@@ -180,8 +205,8 @@ fn parse_iso_with_offset(s: &str) -> Option<i64> {
         "%Y-%m-%dT%H:%M%z",
         "%Y-%m-%d %H:%M%z",
     ] {
-        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
-            return Some(dt.timestamp_millis());
+        if let Ok(ts) = strtime::parse(fmt, s).and_then(|tm| tm.to_timestamp()) {
+            return Some(ts.as_millisecond());
         }
     }
     None
@@ -201,21 +226,21 @@ pub fn parse_iso_ms(value: &str) -> Option<i64> {
     if let Some(ms) = parse_iso_with_offset(&s) {
         return Some(ms);
     }
-    for fmt in &[
+    for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d",
     ] {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(&s, fmt) {
-            return Some(Utc.from_utc_datetime(&ndt).timestamp_millis());
-        }
-        if *fmt == "%Y-%m-%d" {
-            if let Ok(d) = NaiveDate::parse_from_str(&s, fmt) {
-                return Some(
-                    Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
-                        .timestamp_millis(),
-                );
+        if fmt == "%Y-%m-%d" {
+            if let Ok(d) = s.parse::<Date>() {
+                if let Ok(z) = d.at(0, 0, 0, 0).to_zoned_datetime(TimeZone::UTC) {
+                    return Some(z.timestamp().as_millisecond());
+                }
+            }
+        } else if let Ok(ndt) = strtime::parse(fmt, &s).and_then(|tm| tm.to_datetime()) {
+            if let Ok(z) = ndt.to_zoned_datetime(TimeZone::UTC) {
+                return Some(z.timestamp().as_millisecond());
             }
         }
     }
@@ -238,38 +263,38 @@ pub fn to_ms(v: &Value) -> Option<i64> {
     }
 }
 
-pub fn iso(ms_val: Option<i64>) -> Option<String> {
+fn to_local_zoned(ms_val: Option<i64>) -> Option<ZonedDateTime> {
     let ms = ms_val.filter(|&m| m != 0)?;
-    let dt = Local.timestamp_millis_opt(ms).single()?;
-    Some(dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+    let ts = Timestamp::from_millisecond(ms).ok()?;
+    Some(ts.to_zoned_datetime(local_tz()))
+}
+
+pub fn iso(ms_val: Option<i64>) -> Option<String> {
+    let z = to_local_zoned(ms_val)?;
+    Some(z.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string())
 }
 
 pub fn short(ms_val: Option<i64>) -> String {
-    match ms_val
-        .filter(|&m| m != 0)
-        .and_then(|m| Local.timestamp_millis_opt(m).single())
-    {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+    match to_local_zoned(ms_val) {
+        Some(z) => z.strftime("%Y-%m-%d %H:%M").to_string(),
         None => "????-??-?? ??:??".to_string(),
     }
 }
 
 pub fn day(ms_val: Option<i64>) -> String {
-    match ms_val
-        .filter(|&m| m != 0)
-        .and_then(|m| Local.timestamp_millis_opt(m).single())
-    {
-        Some(dt) => dt.format("%Y-%m-%d").to_string(),
+    match to_local_zoned(ms_val) {
+        Some(z) => z.strftime("%Y-%m-%d").to_string(),
         None => "Unknown date".to_string(),
     }
 }
 
 pub fn hhmm(ms_val: Option<i64>) -> String {
-    match ms_val
-        .filter(|&m| m != 0)
-        .and_then(|m| Local.timestamp_millis_opt(m).single())
-    {
-        Some(dt) => dt.format("%H:%M").to_string(),
+    match to_local_zoned(ms_val) {
+        Some(z) => z.strftime("%H:%M").to_string(),
         None => "??:??".to_string(),
     }
+}
+
+pub fn parse_datetime_fmt(s: &str, fmt: &str) -> Option<DateTime> {
+    strtime::parse(fmt, s).ok().and_then(|tm| tm.to_datetime().ok())
 }

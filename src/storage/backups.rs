@@ -1,7 +1,8 @@
 use crate::paths;
 use crate::storage::archive::{self, ArchiveError, SCHEMA_VERSION};
 use crate::storage::db;
-use chrono::{Datelike, Local, NaiveDateTime};
+use crate::timeutil;
+use jiff::civil::DateTime;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -209,11 +210,11 @@ pub fn compress_old_backups_with_warnings(dir: Option<&Path>) -> (usize, Vec<Str
 }
 
 pub fn backups_to_keep(names: &[String], daily: usize, weekly: usize, monthly: usize) -> HashSet<String> {
-    let mut dated: Vec<(NaiveDateTime, String)> = Vec::new();
+    let mut dated: Vec<(DateTime, String)> = Vec::new();
     let mut keep = HashSet::new();
     for n in names {
         let norm = format!("{}.xz", n.strip_suffix(".xz").unwrap_or(n));
-        if let Ok(t) = NaiveDateTime::parse_from_str(&norm, "archive-%Y%m%d-%H%M%S.sqlite3.xz") {
+        if let Some(t) = timeutil::parse_datetime_fmt(&norm, "archive-%Y%m%d-%H%M%S.sqlite3.xz") {
             dated.push((t, n.clone()));
         } else {
             keep.insert(n.clone());
@@ -225,7 +226,7 @@ pub fn backups_to_keep(names: &[String], daily: usize, weekly: usize, monthly: u
     }
     let mut seen_weeks = HashSet::new();
     for (t, n) in &dated {
-        let iso_w = t.iso_week();
+        let iso_w = t.date().iso_week_date();
         let bucket = (iso_w.year(), iso_w.week());
         if !seen_weeks.contains(&bucket) && seen_weeks.len() < weekly {
             seen_weeks.insert(bucket);
@@ -318,7 +319,9 @@ pub fn backup_if_due(conn: &Connection, every_hours: f64) -> Result<Option<PathB
             free as f64 / 1e9
         )));
     }
-    let stamp = Local::now().format("archive-%Y%m%d-%H%M%S.sqlite3.xz").to_string();
+    let stamp = timeutil::local_now()
+        .strftime("archive-%Y%m%d-%H%M%S.sqlite3.xz")
+        .to_string();
     let dest = backup(conn, &d.join(stamp))?;
     archive::set_meta(conn, "backup_error", "")?;
     let (_, warnings) = compress_old_backups_with_warnings(Some(&d));
@@ -685,7 +688,7 @@ pub fn restore_backup(backup_path: &Path, dest: Option<&Path>, safety_backup: bo
 }
 
 fn safety_copy(dest: &Path) -> Result<Option<PathBuf>, ArchiveError> {
-    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let stamp = timeutil::local_now().strftime("%Y%m%d-%H%M%S").to_string();
     let target = paths::backups_dir().join(format!("archive-before-restore-{stamp}.sqlite3.xz"));
     let try_clean = (|| -> Result<Option<PathBuf>, ArchiveError> {
         let c = Connection::open(dest)?;

@@ -707,18 +707,27 @@ fn missing_cache_is_not_retried() {
 fn torn_snapshot_on_final_attempt_fails_loudly() {
     let src = source();
     write_leveldb_log(&src.ldb.join("000002.log"), &[db_meta(&db_name("profiles"), 1, 1)]);
+    fs::write(src.ldb.join("000003.blob"), vec![0xAB; 8 * 1024 * 1024]).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
     let writer = {
         let stop = stop.clone();
+        let ready = ready.clone();
         let path = src.ldb.join("MANIFEST-000001");
         std::thread::spawn(move || {
+            let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
             let mut i = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 i += 1;
-                let _ = fs::write(&path, i.to_le_bytes().repeat((i % 7 + 1) as usize));
+                let _ = std::io::Write::write_all(&mut file, &i.to_le_bytes());
+                let _ = std::io::Write::flush(&mut file);
+                ready.store(true, Ordering::Release);
             }
         })
     };
+    while !ready.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
     let res = sync::snapshot_source(&src.root, 2, 0);
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();

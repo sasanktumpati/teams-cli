@@ -2,7 +2,7 @@ use crate::formatters::Quoted;
 use crate::json_codec;
 use crate::live::auth;
 use crate::storage::{archive, db};
-use chrono::Utc;
+use jiff::Timestamp;
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -204,7 +204,7 @@ pub fn build_payload(
     } else {
         format_plain_html(text)
     };
-    let composetime = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let composetime = Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     Ok(json!({
         "content": content,
         "messagetype": "RichText/Html",

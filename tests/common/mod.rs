@@ -42,8 +42,9 @@ pub fn t(hours_ago: f64) -> i64 {
 }
 
 pub fn iso_utc(ms: i64) -> String {
-    let d = chrono::DateTime::from_timestamp_millis(ms).unwrap();
-    format!("{}{:06}1Z", d.format("%Y-%m-%dT%H:%M:%S."), d.timestamp_subsec_micros())
+    let ts = jiff::Timestamp::from_millisecond(ms).unwrap();
+    let micros = (ts.subsec_nanosecond() / 1_000) as u32;
+    format!("{}{:06}1Z", ts.strftime("%Y-%m-%dT%H:%M:%S."), micros)
 }
 
 pub fn msg(conv: &str, mid: &str, sender: &str, html: &str, arrived: i64, name: &str) -> Message {

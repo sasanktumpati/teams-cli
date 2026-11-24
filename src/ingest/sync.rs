@@ -294,7 +294,7 @@ fn maybe_backup(conn: &rusqlite::Connection, stats: &mut Map<String, Value>, not
         Err(e) => {
             let msg = e.to_string();
             stats.insert("backup_error".to_string(), Value::String(msg.clone()));
-            let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let stamp = crate::timeutil::local_now().strftime("%Y-%m-%d %H:%M").to_string();
             let _ = archive::set_meta(conn, "backup_error", &format!("{stamp}: {msg}"));
             if notify {
                 send_notification(

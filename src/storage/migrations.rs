@@ -184,7 +184,7 @@ pub fn migrate(conn: &Connection) -> Result<(), ArchiveError> {
             record_err(&e);
             return Err(e);
         }
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let stamp = crate::timeutil::local_now().strftime("%Y%m%d-%H%M%S").to_string();
         let dest = bdir.join(format!("archive-before-v{SCHEMA_VERSION}-{stamp}.sqlite3.xz"));
         if !dest.exists() {
             if let Err(e) = backups::backup(conn, &dest) {
