@@ -6,7 +6,9 @@ Reads the Teams desktop IndexedDB/LevelDB cache into an append-only SQLite archi
 
 ## Install
 
-Requires macOS with Microsoft Teams (v2) and Rust 1.89+.
+Requires macOS with Microsoft Teams (v2).
+
+Download a prebuilt binary (`aarch64-apple-darwin` or `x86_64-apple-darwin`) from [GitHub Releases](https://github.com/sasanktumpati/teams-cli/releases), or build from source with Rust 1.89+:
 
 ```sh
 cargo install --path . --force
@@ -14,6 +16,8 @@ teams sync
 teams agent install
 teams doctor
 ```
+
+Verify release provenance with `gh attestation verify teams-*.tar.gz -R sasanktumpati/teams-cli`.
 
 On first run, allow macOS to access `~/Library/Containers/com.microsoft.teams2/`.
 

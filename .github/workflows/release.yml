@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          pkg_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          expected="v${pkg_version}"
+          if [ "${GITHUB_REF_NAME}" != "${expected}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${expected}" >&2
+            exit 1
+          fi
+
+      - name: Build release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}"
+          codesign --force --sign - "target/${{ matrix.target }}/release/teams"
+          codesign --verify --strict "target/${{ matrix.target }}/release/teams"
+          file "target/${{ matrix.target }}/release/teams"
+
+      - name: Smoke test native binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          "target/${{ matrix.target }}/release/teams" --version
+          "target/${{ matrix.target }}/release/teams" --help > /dev/null
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist stage
+          cp "target/${{ matrix.target }}/release/teams" stage/teams
+          cp README.md stage/README.md
+          chmod 755 stage/teams
+          tar -czf "dist/teams-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" -C stage teams README.md
+          tar -tzf "dist/teams-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: teams-${{ matrix.target }}
+          path: dist/teams-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          sha256sum teams-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            dist/teams-*.tar.gz
+            dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
