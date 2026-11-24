@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Build & Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            rust: stable
+            lint: true
+          - os: macos-latest
+            rust: "1.89.0"
+            lint: false
+          - os: ubuntu-latest
+            rust: stable
+            lint: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: ${{ matrix.lint && 'rustfmt, clippy' || '' }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+
+      - name: Check formatting
+        if: matrix.lint
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        if: matrix.lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Enforce no comments
+        if: matrix.lint
+        run: cargo test --locked --test no_comments
+
+      - name: Run test suite
+        run: cargo test --locked
+
+  advisories:
+    name: Security Advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd
+        with:
+          command: check
+          command-arguments: advisories
