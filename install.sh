@@ -4,6 +4,28 @@ set -eu
 REPO="sasanktumpati/teams-cli"
 INSTALL_DIR="${TEAMS_CLI_INSTALL_DIR:-$HOME/.local/bin}"
 
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD="$(printf '\033[1m')"
+  DIM="$(printf '\033[2m')"
+  GREEN="$(printf '\033[32m')"
+  YELLOW="$(printf '\033[33m')"
+  RESET="$(printf '\033[0m')"
+else
+  BOLD=""
+  DIM=""
+  GREEN=""
+  YELLOW=""
+  RESET=""
+fi
+
+step() {
+  printf "  ${DIM}%-12s${RESET} %s\n" "$1" "$2"
+}
+
+ok_step() {
+  printf "  ${GREEN}%-12s${RESET} %s\n" "$1" "$2"
+}
+
 OS="$(uname -s)"
 if [ "$OS" != "Darwin" ]; then
   echo "teams-cli only supports macOS (detected: $OS)." >&2
@@ -34,13 +56,26 @@ else
   fi
 fi
 
+PREV_VERSION=""
+if [ -x "$INSTALL_DIR/teams" ]; then
+  PREV_VERSION="$("$INSTALL_DIR/teams" --version 2>/dev/null | awk '{ print $NF }' || true)"
+fi
+
 ARCHIVE="teams-${TAG}-${TARGET}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/teams-cli-install.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+DEST_TMP=""
+cleanup() {
+  rm -rf "$TMP"
+  if [ -n "$DEST_TMP" ] && [ -e "$DEST_TMP" ]; then
+    rm -f "$DEST_TMP"
+  fi
+}
+trap cleanup EXIT
 
-echo "Downloading teams-cli $TAG ($TARGET)..."
+printf "${BOLD}teams-cli %s${RESET} ${DIM}(%s)${RESET}\n" "$TAG" "$TARGET"
+step "downloading" "$ARCHIVE"
 curl -fsSL --proto '=https' --tlsv1.2 "$BASE_URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
 curl -fsSL --proto '=https' --tlsv1.2 "$BASE_URL/SHA256SUMS.txt" -o "$TMP/SHA256SUMS.txt"
 
@@ -58,6 +93,9 @@ if [ "$ACTUAL" != "$EXPECTED" ]; then
   exit 1
 fi
 
+SHORT_HASH="$(printf '%s' "$ACTUAL" | cut -c1-12)"
+ok_step "verified" "sha256 ${SHORT_HASH}..."
+
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP" teams
 if [ ! -f "$TMP/teams" ]; then
   echo "Archive $ARCHIVE did not contain teams binary." >&2
@@ -73,13 +111,47 @@ DEST_TMP="$INSTALL_DIR/.teams.tmp.$$"
 cp "$TMP/teams" "$DEST_TMP"
 chmod 755 "$DEST_TMP"
 mv -f "$DEST_TMP" "$INSTALL_DIR/teams"
+DEST_TMP=""
 
-echo "Installed $("$INSTALL_DIR/teams" --version) to $INSTALL_DIR/teams"
+NEW_VERSION="$("$INSTALL_DIR/teams" --version | awk '{ print $NF }')"
+if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$NEW_VERSION" ]; then
+  ok_step "installed" "$INSTALL_DIR/teams (v${PREV_VERSION} -> v${NEW_VERSION})"
+elif [ -n "$PREV_VERSION" ]; then
+  ok_step "installed" "$INSTALL_DIR/teams (reinstalled v${NEW_VERSION})"
+else
+  ok_step "installed" "$INSTALL_DIR/teams"
+fi
 
+PLIST="$HOME/Library/LaunchAgents/dev.teams-cli.daemon.plist"
+if [ -f "$PLIST" ] && grep -Fq "<string>$INSTALL_DIR/teams</string>" "$PLIST" 2>/dev/null; then
+  if launchctl print "gui/$(id -u)/dev.teams-cli.daemon" >/dev/null 2>&1; then
+    if "$INSTALL_DIR/teams" agent restart >/dev/null 2>&1; then
+      ok_step "daemon" "restarted"
+    fi
+  fi
+fi
+
+NEED_PATH=0
 case ":${PATH}:" in
   *":$INSTALL_DIR:"*) ;;
-  *)
-    echo "Add $INSTALL_DIR to your PATH:"
-    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
-    ;;
+  *) NEED_PATH=1 ;;
 esac
+
+ACTIVE_BIN="$(command -v teams 2>/dev/null || true)"
+if [ "$NEED_PATH" = "1" ]; then
+  printf "\n${YELLOW}PATH${RESET}\n"
+  printf "  export PATH=\"%s:\$PATH\"\n" "$INSTALL_DIR"
+fi
+
+if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$INSTALL_DIR/teams" ]; then
+  printf "\n${YELLOW}Note${RESET}\n"
+  printf "  Another 'teams' binary is earlier in PATH: %s\n" "$ACTIVE_BIN"
+  printf "  Remove it or rerun with TEAMS_CLI_INSTALL_DIR=\"%s\"\n" "$(dirname "$ACTIVE_BIN")"
+fi
+
+if [ -z "$PREV_VERSION" ]; then
+  printf "\n${BOLD}Next${RESET}\n"
+  printf "  teams sync\n"
+  printf "  teams agent install\n"
+  printf "  teams doctor\n"
+fi

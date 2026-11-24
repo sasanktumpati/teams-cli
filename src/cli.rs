@@ -2088,21 +2088,39 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             let outcome = update::run_update(&opts).map_err(CliError::Runtime)?;
             if json {
                 fmt::print_json(&outcome.to_json());
-            } else if outcome.updated {
-                println!(
-                    "Updated teams v{} -> v{} ({})",
-                    outcome.current_version, outcome.target_version, outcome.binary_path
-                );
-                if outcome.daemon_restarted {
-                    println!("Daemon restarted.");
-                }
-            } else if outcome.update_available {
-                println!(
-                    "Update available: v{} -> v{} (run `teams update` to install)",
-                    outcome.current_version, outcome.target_version
-                );
             } else {
-                println!("teams is already up to date (v{}).", outcome.current_version);
+                let color =
+                    std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none();
+                let (bold, dim, green, reset) = if color {
+                    ("\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[0m")
+                } else {
+                    ("", "", "", "")
+                };
+                if outcome.updated {
+                    println!(
+                        "{bold}teams-cli v{} -> v{}{reset} {dim}({}){reset}",
+                        outcome.current_version, outcome.target_version, outcome.target_triple
+                    );
+                    if let Some(ref hash) = outcome.sha256 {
+                        let short = &hash[..hash.len().min(12)];
+                        println!("  {green}{:<12}{reset} sha256 {short}...", "verified");
+                    }
+                    println!("  {green}{:<12}{reset} {}", "installed", outcome.binary_path);
+                    if outcome.daemon_restarted {
+                        println!("  {green}{:<12}{reset} restarted", "daemon");
+                    }
+                } else if outcome.update_available {
+                    println!(
+                        "{bold}teams-cli v{} -> v{}{reset} {dim}(update available){reset}",
+                        outcome.current_version, outcome.target_version
+                    );
+                    println!("  {dim}{:<12}{reset} teams update", "run");
+                } else {
+                    println!(
+                        "{bold}teams-cli v{}{reset} {green}(up to date){reset}",
+                        outcome.current_version
+                    );
+                }
             }
             if let Some(ref err) = outcome.daemon_restart_error {
                 eprintln!("teams: daemon restart failed ({err}); run `teams agent restart`");
