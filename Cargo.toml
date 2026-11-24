@@ -1,6 +1,6 @@
 [package]
 name = "teams-cli"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.89"
 description = "Durable local archive, CLI, and authenticated loopback HTTP API for the Microsoft Teams (v2) desktop cache on macOS"
