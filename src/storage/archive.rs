@@ -1,7 +1,10 @@
 use crate::identity;
 use crate::ingest::extract::{
-    render_text, volatile_fields, Conversation, Message, Person, RawRecord, Snapshot, RENDER_VERSION,
+    self, render_text, volatile_fields, Conversation, ExtractError, ExtractSink, Message, Person, RawRecord, Snapshot,
+    RENDER_VERSION,
 };
+use crate::ingest::indexeddb::TeamsCache;
+use crate::ingest::SourceError;
 use crate::json_codec;
 use crate::storage::{db, migrations};
 use crate::timeutil;
@@ -318,8 +321,8 @@ fn message_unchanged(m: &Message, p: &PreparedMsg, c: &CachedMsg) -> bool {
 fn load_existing_messages(
     conn: &Connection,
     keys: &[(&str, &str)],
-) -> Result<HashMap<(String, String), CachedMsg>, ArchiveError> {
-    let mut out = HashMap::with_capacity(keys.len());
+) -> Result<HashMap<String, HashMap<String, CachedMsg>>, ArchiveError> {
+    let mut out: HashMap<String, HashMap<String, CachedMsg>> = HashMap::new();
     for chunk in keys.chunks(db::LOOKUP_CHUNK) {
         let sql = format!(
             "SELECT {CACHED_MSG_COLS}, conversation_id, message_id FROM messages \
@@ -331,24 +334,27 @@ fn load_existing_messages(
             rusqlite::params_from_iter(chunk.iter().flat_map(|(c, m)| [*c, *m])),
             |r| {
                 Ok((
-                    (r.get::<_, String>(10)?, r.get::<_, String>(11)?),
+                    r.get::<_, String>(10)?,
+                    r.get::<_, String>(11)?,
                     CachedMsg::from_row(r)?,
                 ))
             },
         )?;
         for row in rows {
-            let (k, v) = row?;
-            out.insert(k, v);
+            let (cid, mid, v) = row?;
+            out.entry(cid).or_default().insert(mid, v);
         }
     }
     Ok(out)
 }
 
+type RecordVersionSet = HashMap<String, HashMap<String, HashSet<String>>>;
+
 fn load_existing_record_versions(
     conn: &Connection,
     keys: &[(&str, &str, &str)],
-) -> Result<HashSet<(String, String, String)>, ArchiveError> {
-    let mut out = HashSet::new();
+) -> Result<RecordVersionSet, ArchiveError> {
+    let mut out: RecordVersionSet = HashMap::new();
     if keys.is_empty() || !db::table_exists(conn, "record_versions") {
         return Ok(out);
     }
@@ -364,7 +370,8 @@ fn load_existing_record_versions(
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )?;
         for row in rows {
-            out.insert(row?);
+            let (src, rk, h) = row?;
+            out.entry(src).or_default().entry(rk).or_default().insert(h);
         }
     }
     Ok(out)
@@ -382,13 +389,7 @@ fn batch_touch_messages(conn: &Connection, pks: &[i64], now: i64) -> Result<(), 
     Ok(())
 }
 
-pub fn apply_snapshot(
-    conn: &Connection,
-    snap: &Snapshot,
-    now_override: Option<i64>,
-) -> Result<BTreeMap<String, i64>, ArchiveError> {
-    let now = now_override.unwrap_or_else(now_ms);
-    let mut st: BTreeMap<String, i64> = BTreeMap::new();
+fn schema_capabilities(conn: &Connection) -> Result<(bool, bool, bool), ArchiveError> {
     let schema_ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
     let has_member_table = schema_ver >= 5 || db::table_exists(conn, "conversation_members");
     let has_mention_table = schema_ver >= 6 || db::table_exists(conn, "message_mentions");
@@ -404,16 +405,278 @@ pub fn apply_snapshot(
         }
         found
     };
+    Ok((has_member_table, has_mention_table, has_read_cols))
+}
 
-    let record_hashes: Vec<String> = snap.records.iter().map(|r| record_hash(&r.source, &r.data)).collect();
-
-    let mut by_msg: HashMap<(&str, &str), Vec<&Message>> = HashMap::with_capacity(snap.messages.len());
-    for m in &snap.messages {
+fn apply_message_slice(
+    conn: &Connection,
+    messages: &[Message],
+    now: i64,
+    has_mention_table: bool,
+    st: &mut BTreeMap<String, i64>,
+    touch_pks: &mut Vec<i64>,
+) -> Result<(), ArchiveError> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let mut by_msg: HashMap<(&str, &str), Vec<&Message>> = HashMap::with_capacity(messages.len());
+    for m in messages {
         by_msg
             .entry((m.conversation_id.as_str(), m.message_id.as_str()))
             .or_default()
             .push(m);
     }
+    let msg_keys: Vec<(&str, &str)> = by_msg.keys().copied().collect();
+    let existing_msgs = load_existing_messages(conn, &msg_keys)?;
+
+    for ((cid, mid), mut group) in by_msg {
+        let cached = existing_msgs.get(cid).and_then(|m| m.get(mid));
+        if group.len() > 1 {
+            group.sort_by(|a, b| {
+                a.version
+                    .cmp(&b.version)
+                    .then_with(|| a.edited_at.unwrap_or(0).cmp(&b.edited_at.unwrap_or(0)))
+                    .then_with(|| a.arrived_at.unwrap_or(0).cmp(&b.arrived_at.unwrap_or(0)))
+                    .then_with(|| a.content_html.cmp(&b.content_html))
+            });
+            let newest = *group.last().unwrap();
+            let newest_h =
+                (!newest.content_html.trim().is_empty()).then(|| content_hash(&newest.content_html, &newest.subject));
+            if cached.is_some_and(|c| c.version == newest.version && c.content_hash == newest_h) {
+                let mut rev_stmt = conn.prepare_cached(
+                    "INSERT OR IGNORE INTO message_revisions \
+                     (conversation_id, message_id, version, content_hash, content_html, text, subject, edited_at, captured_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )?;
+                for older in &group[..group.len() - 1] {
+                    if !older.content_html.trim().is_empty() {
+                        let oh = content_hash(&older.content_html, &older.subject);
+                        let rc = rev_stmt.execute(params![
+                            older.conversation_id,
+                            older.message_id,
+                            older.version,
+                            oh,
+                            older.content_html,
+                            older.text,
+                            older.subject,
+                            older.edited_at,
+                            now
+                        ])?;
+                        *st.entry("revisions_new".to_string()).or_insert(0) += rc as i64;
+                    }
+                }
+                group = vec![newest];
+            }
+        }
+
+        if let [m] = group[..] {
+            let prep = PreparedMsg::of(m);
+            if let Some(c) = cached {
+                if message_unchanged(m, &prep, c) {
+                    touch_pks.push(c.pk);
+                    continue;
+                }
+            }
+            upsert_message(conn, m, prep, now, st, touch_pks, has_mention_table)?;
+        } else {
+            for m in group {
+                upsert_message(conn, m, PreparedMsg::of(m), now, st, touch_pks, has_mention_table)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flush_record_versions(
+    conn: &Connection,
+    records: &[RawRecord],
+    hashes: &[String],
+    now: i64,
+) -> Result<i64, ArchiveError> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let rv_keys: Vec<(&str, &str, &str)> = records
+        .iter()
+        .zip(hashes)
+        .map(|(r, h)| (r.source.as_str(), r.key.as_str(), h.as_str()))
+        .collect();
+    let mut existing_rv = load_existing_record_versions(conn, &rv_keys)?;
+    let mut rv_new = 0i64;
+    for (r, h) in records.iter().zip(hashes) {
+        rv_new += keep_version(conn, r, h, now, &mut existing_rv)?;
+    }
+    Ok(rv_new)
+}
+
+pub struct ApplyCacheResult {
+    pub merged: BTreeMap<String, i64>,
+    pub cache_stats: BTreeMap<String, i64>,
+}
+
+pub enum ApplyCacheError {
+    Source(SourceError),
+    Archive(ArchiveError),
+}
+
+struct StreamingApplier<'a> {
+    conn: &'a Connection,
+    now: i64,
+    has_member_table: bool,
+    has_mention_table: bool,
+    has_read_cols: bool,
+    st: BTreeMap<String, i64>,
+    conv_new: i64,
+    rv_new: i64,
+    me_mri: Option<String>,
+    touch_pks: Vec<i64>,
+    msg_buf: Vec<Message>,
+    rv_buf: Vec<RawRecord>,
+    rv_hashes: Vec<String>,
+}
+
+impl<'a> StreamingApplier<'a> {
+    fn flush_messages(&mut self) -> Result<(), ArchiveError> {
+        if self.msg_buf.is_empty() {
+            return Ok(());
+        }
+        apply_message_slice(
+            self.conn,
+            &self.msg_buf,
+            self.now,
+            self.has_mention_table,
+            &mut self.st,
+            &mut self.touch_pks,
+        )?;
+        self.msg_buf.clear();
+        if self.touch_pks.len() >= 500 {
+            batch_touch_messages(self.conn, &self.touch_pks, self.now)?;
+            self.touch_pks.clear();
+        }
+        Ok(())
+    }
+
+    fn flush_records(&mut self) -> Result<(), ArchiveError> {
+        if self.rv_buf.is_empty() {
+            return Ok(());
+        }
+        self.rv_new += flush_record_versions(self.conn, &self.rv_buf, &self.rv_hashes, self.now)?;
+        self.rv_buf.clear();
+        self.rv_hashes.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<BTreeMap<String, i64>, ArchiveError> {
+        self.flush_messages()?;
+        if !self.touch_pks.is_empty() {
+            batch_touch_messages(self.conn, &self.touch_pks, self.now)?;
+            self.touch_pks.clear();
+        }
+        self.flush_records()?;
+        self.st.insert("conversations_new".to_string(), self.conv_new);
+        self.st.insert("record_versions_new".to_string(), self.rv_new);
+        if let Some(ref me) = self.me_mri {
+            set_meta(self.conn, "me_mri", me)?;
+        }
+        Ok(self.st)
+    }
+}
+
+impl ExtractSink for StreamingApplier<'_> {
+    type Error = ArchiveError;
+
+    fn on_me(&mut self, me_mri: &str) -> Result<(), Self::Error> {
+        self.me_mri = Some(me_mri.to_string());
+        Ok(())
+    }
+
+    fn on_person(&mut self, person: Person) -> Result<(), Self::Error> {
+        upsert_person(self.conn, &person, self.now)
+    }
+
+    fn on_conversation(&mut self, conv: Conversation) -> Result<(), Self::Error> {
+        self.conv_new += upsert_conversation(self.conn, &conv, self.now, self.has_member_table, self.has_read_cols)?;
+        Ok(())
+    }
+
+    fn on_message(&mut self, msg: Message) -> Result<(), Self::Error> {
+        self.msg_buf.push(msg);
+        if self.msg_buf.len() >= db::LOOKUP_CHUNK {
+            self.flush_messages()?;
+        }
+        Ok(())
+    }
+
+    fn on_record(&mut self, rec: RawRecord) -> Result<(), Self::Error> {
+        let h = record_hash(&rec.source, &rec.data);
+        self.rv_buf.push(rec);
+        self.rv_hashes.push(h);
+        if self.rv_buf.len() >= db::LOOKUP_CHUNK {
+            self.flush_records()?;
+        }
+        Ok(())
+    }
+}
+
+pub fn apply_cache(
+    conn: &Connection,
+    cache: &mut TeamsCache,
+    now_override: Option<i64>,
+) -> Result<ApplyCacheResult, ApplyCacheError> {
+    let now = now_override.unwrap_or_else(now_ms);
+    let (has_member_table, has_mention_table, has_read_cols) =
+        schema_capabilities(conn).map_err(ApplyCacheError::Archive)?;
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| ApplyCacheError::Archive(ArchiveError::from(e)))?;
+
+    let mut applier = StreamingApplier {
+        conn,
+        now,
+        has_member_table,
+        has_mention_table,
+        has_read_cols,
+        st: BTreeMap::new(),
+        conv_new: 0,
+        rv_new: 0,
+        me_mri: None,
+        touch_pks: Vec::new(),
+        msg_buf: Vec::with_capacity(db::LOOKUP_CHUNK),
+        rv_buf: Vec::with_capacity(db::LOOKUP_CHUNK),
+        rv_hashes: Vec::with_capacity(db::LOOKUP_CHUNK),
+    };
+
+    let res = match extract::extract_into(cache, &mut applier) {
+        Ok(cache_stats) => applier
+            .finish()
+            .map(|merged| ApplyCacheResult { merged, cache_stats })
+            .map_err(ApplyCacheError::Archive),
+        Err(ExtractError::Source(e)) => Err(ApplyCacheError::Source(e)),
+        Err(ExtractError::Sink(e)) => Err(ApplyCacheError::Archive(e)),
+    };
+
+    match res {
+        Ok(pair) => {
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| ApplyCacheError::Archive(ArchiveError::from(e)))?;
+            Ok(pair)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+pub fn apply_snapshot(
+    conn: &Connection,
+    snap: &Snapshot,
+    now_override: Option<i64>,
+) -> Result<BTreeMap<String, i64>, ArchiveError> {
+    let now = now_override.unwrap_or_else(now_ms);
+    let mut st: BTreeMap<String, i64> = BTreeMap::new();
+    let (has_member_table, has_mention_table, has_read_cols) = schema_capabilities(conn)?;
+
+    let record_hashes: Vec<String> = snap.records.iter().map(|r| record_hash(&r.source, &r.data)).collect();
 
     let mut touch_pks: Vec<i64> = Vec::new();
     conn.execute_batch("BEGIN IMMEDIATE;")?;
@@ -427,88 +690,13 @@ pub fn apply_snapshot(
         }
         st.insert("conversations_new".to_string(), conv_new);
 
-        let msg_keys: Vec<(&str, &str)> = by_msg.keys().copied().collect();
-        let existing_msgs = load_existing_messages(conn, &msg_keys)?;
-
-        for ((cid, mid), mut group) in by_msg {
-            let cached = existing_msgs.get(&(cid.to_string(), mid.to_string()));
-            if group.len() > 1 {
-                group.sort_by(|a, b| {
-                    a.version
-                        .cmp(&b.version)
-                        .then_with(|| a.edited_at.unwrap_or(0).cmp(&b.edited_at.unwrap_or(0)))
-                        .then_with(|| a.arrived_at.unwrap_or(0).cmp(&b.arrived_at.unwrap_or(0)))
-                        .then_with(|| a.content_html.cmp(&b.content_html))
-                });
-                let newest = *group.last().unwrap();
-                let newest_h = (!newest.content_html.trim().is_empty())
-                    .then(|| content_hash(&newest.content_html, &newest.subject));
-                if cached.is_some_and(|c| c.version == newest.version && c.content_hash == newest_h) {
-                    let mut rev_stmt = conn.prepare_cached(
-                        "INSERT OR IGNORE INTO message_revisions \
-                         (conversation_id, message_id, version, content_hash, content_html, text, subject, edited_at, captured_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )?;
-                    for older in &group[..group.len() - 1] {
-                        if !older.content_html.trim().is_empty() {
-                            let oh = content_hash(&older.content_html, &older.subject);
-                            let rc = rev_stmt.execute(params![
-                                older.conversation_id,
-                                older.message_id,
-                                older.version,
-                                oh,
-                                older.content_html,
-                                older.text,
-                                older.subject,
-                                older.edited_at,
-                                now
-                            ])?;
-                            *st.entry("revisions_new".to_string()).or_insert(0) += rc as i64;
-                        }
-                    }
-                    group = vec![newest];
-                }
-            }
-
-            if let [m] = group[..] {
-                let prep = PreparedMsg::of(m);
-                if let Some(c) = cached {
-                    if message_unchanged(m, &prep, c) {
-                        touch_pks.push(c.pk);
-                        continue;
-                    }
-                }
-                upsert_message(conn, m, prep, now, &mut st, &mut touch_pks, has_mention_table)?;
-            } else {
-                for m in group {
-                    upsert_message(
-                        conn,
-                        m,
-                        PreparedMsg::of(m),
-                        now,
-                        &mut st,
-                        &mut touch_pks,
-                        has_mention_table,
-                    )?;
-                }
-            }
-        }
+        apply_message_slice(conn, &snap.messages, now, has_mention_table, &mut st, &mut touch_pks)?;
 
         if !touch_pks.is_empty() {
             batch_touch_messages(conn, &touch_pks, now)?;
         }
 
-        let rv_keys: Vec<(&str, &str, &str)> = snap
-            .records
-            .iter()
-            .zip(&record_hashes)
-            .map(|(r, h)| (r.source.as_str(), r.key.as_str(), h.as_str()))
-            .collect();
-        let mut existing_rv = load_existing_record_versions(conn, &rv_keys)?;
-        let mut rv_new = 0i64;
-        for (r, h) in snap.records.iter().zip(&record_hashes) {
-            rv_new += keep_version(conn, r, h, now, &mut existing_rv)?;
-        }
+        let rv_new = flush_record_versions(conn, &snap.records, &record_hashes, now)?;
         st.insert("record_versions_new".to_string(), rv_new);
 
         if let Some(ref me) = snap.me_mri {
@@ -541,17 +729,25 @@ fn keep_version(
     r: &RawRecord,
     hash: &str,
     now: i64,
-    existing_rv: &mut HashSet<(String, String, String)>,
+    existing_rv: &mut RecordVersionSet,
 ) -> Result<i64, ArchiveError> {
-    let key = (r.source.clone(), r.key.clone(), hash.to_string());
-    if existing_rv.contains(&key) {
+    if existing_rv
+        .get(&r.source)
+        .and_then(|m| m.get(&r.key))
+        .is_some_and(|s| s.contains(hash))
+    {
         return Ok(0);
     }
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO record_versions (source, record_key, hash, data, captured_at) VALUES (?, ?, ?, ?, ?)",
     )?;
     let rc = stmt.execute(params![r.source, r.key, hash, encode_record(&r.data), now])? as i64;
-    existing_rv.insert(key);
+    existing_rv
+        .entry(r.source.clone())
+        .or_default()
+        .entry(r.key.clone())
+        .or_default()
+        .insert(hash.to_string());
     Ok(rc)
 }
 

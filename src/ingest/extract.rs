@@ -4,6 +4,7 @@ use crate::ingest::{render, SourceError};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -448,13 +449,115 @@ pub fn derive_name(
     (cid.to_string(), true)
 }
 
-pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
-    let me_mri = cache.user_object_id().map(|o| format!("8:orgid:{o}"));
+fn content_dedup_hash(s: &str) -> [u8; 16] {
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
 
-    let mut people: HashMap<String, Person> = HashMap::new();
-    let mut person_records: Vec<RawRecord> = Vec::new();
-    for v in cache.records("profiles", "profiles") {
-        let Some(po) = v.as_object() else { continue };
+pub enum ExtractError<E> {
+    Source(SourceError),
+    Sink(E),
+}
+
+pub trait ExtractSink {
+    type Error;
+    fn on_me(&mut self, me_mri: &str) -> Result<(), Self::Error>;
+    fn on_person(&mut self, person: Person) -> Result<(), Self::Error>;
+    fn on_conversation(&mut self, conv: Conversation) -> Result<(), Self::Error>;
+    fn on_message(&mut self, msg: Message) -> Result<(), Self::Error>;
+    fn on_record(&mut self, rec: RawRecord) -> Result<(), Self::Error>;
+}
+
+struct SnapshotCollector {
+    me_mri: Option<String>,
+    people: HashMap<String, Person>,
+    conversations: HashMap<String, Conversation>,
+    messages: Vec<Message>,
+    records: Vec<RawRecord>,
+}
+
+impl ExtractSink for SnapshotCollector {
+    type Error = std::convert::Infallible;
+
+    fn on_me(&mut self, me_mri: &str) -> Result<(), Self::Error> {
+        self.me_mri = Some(me_mri.to_string());
+        Ok(())
+    }
+
+    fn on_person(&mut self, person: Person) -> Result<(), Self::Error> {
+        self.people.insert(person.mri.clone(), person);
+        Ok(())
+    }
+
+    fn on_conversation(&mut self, conv: Conversation) -> Result<(), Self::Error> {
+        self.conversations.insert(conv.id.clone(), conv);
+        Ok(())
+    }
+
+    fn on_message(&mut self, msg: Message) -> Result<(), Self::Error> {
+        self.messages.push(msg);
+        Ok(())
+    }
+
+    fn on_record(&mut self, rec: RawRecord) -> Result<(), Self::Error> {
+        self.records.push(rec);
+        Ok(())
+    }
+}
+
+pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
+    let mut collector = SnapshotCollector {
+        me_mri: None,
+        people: HashMap::new(),
+        conversations: HashMap::new(),
+        messages: Vec::new(),
+        records: Vec::new(),
+    };
+    let stats = match extract_into(cache, &mut collector) {
+        Ok(st) => st,
+        Err(ExtractError::Source(e)) => return Err(e),
+        Err(ExtractError::Sink(never)) => match never {},
+    };
+    Ok(Snapshot {
+        me_mri: collector.me_mri,
+        people: collector.people,
+        conversations: collector.conversations,
+        messages: collector.messages,
+        stats,
+        records: collector.records,
+    })
+}
+
+pub fn extract_into<S: ExtractSink>(
+    cache: &mut TeamsCache,
+    sink: &mut S,
+) -> Result<BTreeMap<String, i64>, ExtractError<S::Error>> {
+    const CORE_STORES: &[(&str, &str)] = &[
+        ("profiles", "profiles"),
+        ("replychain-manager", "replychains-2"),
+        ("replychain-manager", "replychains"),
+        ("conversation-manager", "conversations"),
+    ];
+    cache.retain_wanted_stores(CORE_STORES, EXTRA_STORES);
+
+    let me_mri = cache.user_object_id().map(|o| format!("8:orgid:{o}"));
+    if let Some(ref me) = me_mri {
+        sink.on_me(me).map_err(ExtractError::Sink)?;
+    }
+    let has_replychain_db = cache.find_database("replychain-manager").is_some();
+
+    let mut by_oid: HashMap<String, String> = HashMap::new();
+    let mut by_mri: HashMap<String, String> = HashMap::new();
+    let mut seen_people: HashSet<String> = HashSet::new();
+    let mut sink_err: Option<S::Error> = None;
+
+    cache.for_each_taken_record("profiles", "profiles", |v| {
+        if sink_err.is_some() {
+            return;
+        }
+        let Some(po) = v.as_object() else { return };
         let mri = {
             let m = get_str(po, "mri");
             if !m.is_empty() {
@@ -464,13 +567,16 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
             }
         };
         if mri.is_empty() {
-            continue;
+            return;
         }
-        person_records.push(RawRecord {
+        if let Err(e) = sink.on_record(RawRecord {
             source: "person".to_string(),
             key: mri.clone(),
             data: v.clone(),
-        });
+        }) {
+            sink_err = Some(e);
+            return;
+        }
         let email_raw = ["email", "$$email", "userPrincipalName"]
             .iter()
             .map(|k| get_str(po, k))
@@ -482,41 +588,34 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
             email_raw
         };
         let kind_raw = get_str(po, "type").to_ascii_lowercase();
-        people.insert(
-            mri.clone(),
-            Person {
-                mri,
-                name: get_str(po, "displayName"),
-                email,
-                job_title: get_str(po, "jobTitle"),
-                department: get_str(po, "department"),
-                kind: if kind_raw.is_empty() {
-                    "person".to_string()
-                } else {
-                    kind_raw
-                },
-                raw: v,
-            },
-        );
-    }
-
-    let by_oid: HashMap<String, String> = people
-        .values()
-        .filter(|p| !p.name.is_empty())
-        .filter_map(|p| {
-            let o = oid(&p.mri);
-            if o.is_empty() {
-                None
-            } else {
-                Some((o, p.name.clone()))
+        let display_name = get_str(po, "displayName");
+        if !display_name.is_empty() {
+            let o = oid(&mri);
+            if !o.is_empty() {
+                by_oid.insert(o, display_name.clone());
             }
-        })
-        .collect();
-    let by_mri: HashMap<String, String> = people
-        .values()
-        .filter(|p| !p.name.is_empty())
-        .map(|p| (p.mri.clone(), p.name.clone()))
-        .collect();
+            by_mri.insert(mri.clone(), display_name.clone());
+        }
+        seen_people.insert(mri.clone());
+        if let Err(e) = sink.on_person(Person {
+            mri,
+            name: display_name,
+            email,
+            job_title: get_str(po, "jobTitle"),
+            department: get_str(po, "department"),
+            kind: if kind_raw.is_empty() {
+                "person".to_string()
+            } else {
+                kind_raw
+            },
+            raw: v,
+        }) {
+            sink_err = Some(e);
+        }
+    });
+    if let Some(e) = sink_err {
+        return Err(ExtractError::Sink(e));
+    }
 
     let name_of = |mri: &str| -> String {
         if let Some(n) = by_mri.get(mri) {
@@ -528,31 +627,164 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
         mri.to_string()
     };
 
-    let mut messages: Vec<Message> = Vec::new();
-    let mut msg_records: Vec<RawRecord> = Vec::new();
-    let mut seen_msgs: HashSet<(String, String, i64, String)> = HashSet::new();
-    let mut chains: i64 = 0;
+    let mut conv_raw: HashMap<String, Value> = HashMap::new();
+    cache.for_each_taken_record("conversation-manager", "conversations", |c| {
+        if sink_err.is_some() {
+            return;
+        }
+        let Some(co) = c.as_object() else { return };
+        let cid = get_str(co, "id");
+        if cid.is_empty() {
+            return;
+        }
+        if let Err(e) = sink.on_record(RawRecord {
+            source: "conversation".to_string(),
+            key: cid.clone(),
+            data: c.clone(),
+        }) {
+            sink_err = Some(e);
+            return;
+        }
+        let ver = co.get("version").and_then(ms).unwrap_or(0);
+        let replace = match conv_raw.get(&cid) {
+            None => true,
+            Some(cur) => ver >= cur.get("version").and_then(ms).unwrap_or(0),
+        };
+        if replace {
+            conv_raw.insert(cid, c);
+        }
+    });
+    if let Some(e) = sink_err {
+        return Err(ExtractError::Sink(e));
+    }
 
-    for store in ["replychains-2", "replychains"] {
-        for rc in cache.records("replychain-manager", store) {
-            let Some(rco) = rc.as_object() else { continue };
-            chains += 1;
-            let Some(mm) = rco.get("messageMap").and_then(|v| v.as_object()) else {
-                continue;
+    let team_names: HashMap<String, String> = conv_raw
+        .iter()
+        .filter_map(|(cid, tv)| {
+            let ttp = tv.get("threadProperties").and_then(|v| v.as_object())?;
+            let s = get_str(ttp, "spaceThreadTopic");
+            let name = if !s.is_empty() { s } else { get_str(ttp, "topic") };
+            (!name.is_empty()).then(|| (cid.clone(), name))
+        })
+        .collect();
+
+    let mut seen_convs: HashSet<String> = HashSet::with_capacity(conv_raw.len());
+    for (cid, c) in conv_raw {
+        let (kind, topic, team_id, members, last_message_at) = {
+            let co = c.as_object().unwrap();
+            let tp = co.get("threadProperties").and_then(|v| v.as_object());
+            let kind = if cid.starts_with("48:") {
+                "system".to_string()
+            } else {
+                kind_by_type(&get_str(co, "type"))
             };
-            let rc_conv = get_str(rco, "conversationId");
-            let rc_thread = {
-                let t = get_str(rco, "replyChainId");
+            let topic = tp
+                .map(|t| {
+                    let s = get_str(t, "topic");
+                    if !s.is_empty() {
+                        s
+                    } else {
+                        get_str(t, "spaceThreadTopic")
+                    }
+                })
+                .unwrap_or_default();
+            let team_id = {
+                let t = get_str(co, "teamId");
                 if t.is_empty() {
                     None
                 } else {
                     Some(t)
                 }
             };
-            for mval in mm.values() {
-                let Some(mo) = mval.as_object() else { continue };
+            let members: Vec<String> = co
+                .get("members")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.as_object().map(|mo| get_str(mo, "id")).filter(|s| !s.is_empty()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let last_message_at = co.get("lastMessageTimeUtc").and_then(ms).or_else(|| {
+                co.get("lastMessage")
+                    .and_then(|v| v.get("originalArrivalTime"))
+                    .and_then(ms)
+            });
+            (kind, topic, team_id, members, last_message_at)
+        };
+        let mut name = topic.clone();
+        let mut fallback = false;
+        if kind == "channel" {
+            let team_name = team_id
+                .as_deref()
+                .and_then(|tid| team_names.get(tid))
+                .map(String::as_str)
+                .unwrap_or("");
+            let channel = if !topic.is_empty() {
+                topic.clone()
+            } else if team_id.as_deref() == Some(cid.as_str()) {
+                "General".to_string()
+            } else {
+                String::new()
+            };
+            name = if !team_name.is_empty() {
+                format!("{team_name} > {channel}")
+            } else {
+                channel
+            };
+        }
+        if name.is_empty() {
+            let (n, fb) = derive_name(&cid, &members, &name_of, me_mri.as_deref());
+            name = n;
+            fallback = fb;
+        }
+        seen_convs.insert(cid.clone());
+        sink.on_conversation(Conversation {
+            id: cid,
+            kind,
+            name,
+            name_is_fallback: fallback,
+            topic,
+            team_id,
+            members,
+            last_message_at,
+            raw: c,
+        })
+        .map_err(ExtractError::Sink)?;
+    }
+    drop(team_names);
+
+    let mut seen_msgs: HashSet<(String, String, i64, [u8; 16])> = HashSet::new();
+    let mut unique_msgs: HashSet<(String, String)> = HashSet::new();
+    let mut chains: i64 = 0;
+
+    for store in ["replychains-2", "replychains"] {
+        cache.for_each_taken_record("replychain-manager", store, |rc| {
+            if sink_err.is_some() {
+                return;
+            }
+            let Value::Object(mut rco) = rc else { return };
+            chains += 1;
+            let rc_conv = get_str(&rco, "conversationId");
+            let rc_thread = {
+                let t = get_str(&rco, "replyChainId");
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            };
+            let Some(Value::Object(mm)) = rco.remove("messageMap") else {
+                return;
+            };
+            drop(rco);
+            for (_, mval) in mm {
+                if sink_err.is_some() {
+                    return;
+                }
+                let Value::Object(mut mo) = mval else { continue };
                 let conv = {
-                    let c = get_str(mo, "conversationId");
+                    let c = get_str(&mo, "conversationId");
                     if !c.is_empty() {
                         c
                     } else {
@@ -560,7 +792,7 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
                     }
                 };
                 let mid = {
-                    let s = get_str(mo, "id");
+                    let s = get_str(&mo, "id");
                     if !s.is_empty() {
                         s
                     } else {
@@ -570,31 +802,62 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
                 if conv.is_empty() || mid.is_empty() {
                     continue;
                 }
-                let content = get_str(mo, "content");
+                let content = get_str(&mo, "content");
                 let version = mo.get("version").and_then(ms).unwrap_or(0);
-                if !seen_msgs.insert((conv.clone(), mid.clone(), version, content.clone())) {
+                if !seen_msgs.insert((conv.clone(), mid.clone(), version, content_dedup_hash(&content))) {
                     continue;
                 }
-                let props = mo
-                    .get("properties")
-                    .filter(|v| v.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(Map::new()));
+                unique_msgs.insert((conv.clone(), mid.clone()));
+                if !seen_convs.contains(&conv) {
+                    let (name, fallback) = derive_name(&conv, &[], &name_of, me_mri.as_deref());
+                    seen_convs.insert(conv.clone());
+                    if let Err(e) = sink.on_conversation(Conversation {
+                        id: conv.clone(),
+                        kind: if conv.starts_with("48:") {
+                            "system".to_string()
+                        } else {
+                            "chat".to_string()
+                        },
+                        name,
+                        name_is_fallback: fallback,
+                        topic: String::new(),
+                        team_id: None,
+                        members: Vec::new(),
+                        last_message_at: None,
+                        raw: Value::Object(Map::new()),
+                    }) {
+                        sink_err = Some(e);
+                        return;
+                    }
+                }
+                if let Err(e) = sink.on_record(RawRecord {
+                    source: "message".to_string(),
+                    key: format!("{conv}/{mid}"),
+                    data: Value::Object(mo.clone()),
+                }) {
+                    sink_err = Some(e);
+                    return;
+                }
+                let props = match mo.remove("properties") {
+                    Some(v) if v.is_object() => v,
+                    _ => Value::Object(Map::new()),
+                };
+                mo.remove("content");
                 let mtype = {
-                    let t = get_str(mo, "messageType");
+                    let t = get_str(&mo, "messageType");
                     if t.is_empty() {
                         "Unknown".to_string()
                     } else {
                         t
                     }
                 };
-                let sender_mri = get_str(mo, "creator");
+                let sender_mri = get_str(&mo, "creator");
                 let sender_name = {
-                    let s1 = get_str(mo, "imDisplayName");
+                    let s1 = get_str(&mo, "imDisplayName");
                     if !s1.is_empty() {
                         s1
                     } else {
-                        let s2 = get_str(mo, "fromDisplayNameInToken");
+                        let s2 = get_str(&mo, "fromDisplayNameInToken");
                         if !s2.is_empty() {
                             s2
                         } else if !sender_mri.is_empty() {
@@ -622,7 +885,7 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
                     .or_else(|| mo.get("clientArrivalTime").and_then(ms));
                 let edited_at = props.get("edittime").and_then(ms);
                 let parent_id = {
-                    let p = get_str(mo, "parentMessageId");
+                    let p = get_str(&mo, "parentMessageId");
                     if p.is_empty() {
                         None
                     } else {
@@ -633,18 +896,8 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
                 let importance = props.as_object().map(|p| get_str(p, "importance")).unwrap_or_default();
                 let reactions = extract_reactions(&props, &name_of);
                 let attachments = extract_attachments(&props, &content);
-                let raw_map: Map<String, Value> = mo
-                    .iter()
-                    .filter(|(k, _)| k.as_str() != "content" && k.as_str() != "properties")
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
 
-                msg_records.push(RawRecord {
-                    source: "message".to_string(),
-                    key: format!("{conv}/{mid}"),
-                    data: mval.clone(),
-                });
-                messages.push(Message {
+                if let Err(e) = sink.on_message(Message {
                     conversation_id: conv,
                     message_id: mid,
                     thread_id: rc_thread.clone(),
@@ -664,194 +917,52 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
                     reactions,
                     attachments,
                     properties: props,
-                    raw: Value::Object(raw_map),
-                });
+                    raw: Value::Object(mo),
+                }) {
+                    sink_err = Some(e);
+                    return;
+                }
             }
+        });
+        if let Some(e) = sink_err {
+            return Err(ExtractError::Sink(e));
         }
     }
+    drop(seen_msgs);
 
-    if cache.find_database("replychain-manager").is_none() || messages.is_empty() {
-        return Err(SourceError(
+    if !has_replychain_db || unique_msgs.is_empty() {
+        return Err(ExtractError::Source(SourceError(
             "No messages found in the Teams cache. Teams may have changed its storage format; \
              run `teams raw stores` to inspect it."
                 .to_string(),
-        ));
+        )));
     }
 
-    let mut conv_raw: HashMap<String, Value> = HashMap::new();
-    let mut conv_records: Vec<RawRecord> = Vec::new();
-    for c in cache.records("conversation-manager", "conversations") {
-        let Some(co) = c.as_object() else { continue };
-        let cid = get_str(co, "id");
-        if cid.is_empty() {
-            continue;
-        }
-        conv_records.push(RawRecord {
-            source: "conversation".to_string(),
-            key: cid.clone(),
-            data: c.clone(),
-        });
-        let ver = co.get("version").and_then(ms).unwrap_or(0);
-        let replace = match conv_raw.get(&cid) {
-            None => true,
-            Some(cur) => ver >= cur.get("version").and_then(ms).unwrap_or(0),
-        };
-        if replace {
-            conv_raw.insert(cid, c);
-        }
-    }
-
-    let mut conversations: HashMap<String, Conversation> = HashMap::new();
-    for (cid, c) in &conv_raw {
-        let co = c.as_object().unwrap();
-        let tp = co.get("threadProperties").and_then(|v| v.as_object());
-        let kind = if cid.starts_with("48:") {
-            "system".to_string()
-        } else {
-            kind_by_type(&get_str(co, "type"))
-        };
-        let topic = tp
-            .map(|t| {
-                let s = get_str(t, "topic");
-                if !s.is_empty() {
-                    s
-                } else {
-                    get_str(t, "spaceThreadTopic")
-                }
-            })
-            .unwrap_or_default();
-        let team_id = {
-            let t = get_str(co, "teamId");
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        };
-        let members: Vec<String> = co
-            .get("members")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.as_object().map(|mo| get_str(mo, "id")).filter(|s| !s.is_empty()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut name = topic.clone();
-        let mut fallback = false;
-        if kind == "channel" {
-            let team_name = team_id
-                .as_deref()
-                .and_then(|tid| conv_raw.get(tid))
-                .and_then(|tv| tv.get("threadProperties"))
-                .and_then(|v| v.as_object())
-                .map(|ttp| {
-                    let s = get_str(ttp, "spaceThreadTopic");
-                    if !s.is_empty() {
-                        s
-                    } else {
-                        get_str(ttp, "topic")
-                    }
-                })
-                .unwrap_or_default();
-            let channel = if !topic.is_empty() {
-                topic.clone()
-            } else if team_id.as_deref() == Some(cid.as_str()) {
-                "General".to_string()
-            } else {
-                String::new()
-            };
-            name = if !team_name.is_empty() {
-                format!("{team_name} > {channel}")
-            } else {
-                channel
-            };
-        }
-        if name.is_empty() {
-            let (n, fb) = derive_name(cid, &members, &name_of, me_mri.as_deref());
-            name = n;
-            fallback = fb;
-        }
-        let last_message_at = co.get("lastMessageTimeUtc").and_then(ms).or_else(|| {
-            co.get("lastMessage")
-                .and_then(|v| v.get("originalArrivalTime"))
-                .and_then(ms)
-        });
-        conversations.insert(
-            cid.clone(),
-            Conversation {
-                id: cid.clone(),
-                kind,
-                name,
-                name_is_fallback: fallback,
-                topic,
-                team_id,
-                members,
-                last_message_at,
-                raw: c.clone(),
-            },
-        );
-    }
-
-    for m in &messages {
-        if !conversations.contains_key(&m.conversation_id) {
-            let (name, fallback) = derive_name(&m.conversation_id, &[], &name_of, me_mri.as_deref());
-            conversations.insert(
-                m.conversation_id.clone(),
-                Conversation {
-                    id: m.conversation_id.clone(),
-                    kind: if m.conversation_id.starts_with("48:") {
-                        "system".to_string()
-                    } else {
-                        "chat".to_string()
-                    },
-                    name,
-                    name_is_fallback: fallback,
-                    topic: String::new(),
-                    team_id: None,
-                    members: Vec::new(),
-                    last_message_at: None,
-                    raw: Value::Object(Map::new()),
-                },
-            );
-        }
-    }
-
-    let mut records = Vec::with_capacity(person_records.len() + conv_records.len() + msg_records.len() + 512);
-    records.extend(person_records);
-    records.extend(conv_records);
-    records.extend(msg_records);
     for &(manager, store) in EXTRA_STORES {
         let src_name = format!("{manager}/{store}");
-        for (k, v) in cache.keyed_records(manager, store) {
-            if v.is_null() {
-                continue;
+        cache.for_each_taken_keyed_record(manager, store, |k, v| {
+            if sink_err.is_some() || v.is_null() {
+                return;
             }
-            records.push(RawRecord {
+            if let Err(e) = sink.on_record(RawRecord {
                 source: src_name.clone(),
                 key: format_record_key(&k),
                 data: v,
-            });
+            }) {
+                sink_err = Some(e);
+            }
+        });
+        if let Some(e) = sink_err {
+            return Err(ExtractError::Sink(e));
         }
     }
 
-    let unique_msgs: HashSet<(&str, &str)> = messages
-        .iter()
-        .map(|m| (m.conversation_id.as_str(), m.message_id.as_str()))
-        .collect();
     let mut stats = BTreeMap::new();
-    stats.insert("cache_people".to_string(), people.len() as i64);
-    stats.insert("cache_conversations".to_string(), conversations.len() as i64);
+    stats.insert("cache_people".to_string(), seen_people.len() as i64);
+    stats.insert("cache_conversations".to_string(), seen_convs.len() as i64);
     stats.insert("cache_messages".to_string(), unique_msgs.len() as i64);
     stats.insert("cache_bad_records".to_string(), cache.bad_records as i64);
     stats.insert("cache_reply_chains".to_string(), chains);
 
-    Ok(Snapshot {
-        me_mri,
-        people,
-        conversations,
-        messages,
-        stats,
-        records,
-    })
+    Ok(stats)
 }

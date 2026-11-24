@@ -294,10 +294,36 @@ fn is_scheduled_backup_classifies_names() {
         "archive-before-restore-20260101-000000.sqlite3.xz"
     ));
     assert!(!backups::is_scheduled_backup(
+        "archive-before-v8-20260101-000000.sqlite3.xz"
+    ));
+    assert!(!backups::is_scheduled_backup(
         "archive-20260101-000000.sqlite3.xz.partial"
     ));
     assert!(!backups::is_scheduled_backup("notes.sqlite3"));
     assert!(!backups::is_scheduled_backup(""));
+}
+
+#[test]
+fn backup_if_due_cleans_stale_partials_even_when_skipped() {
+    let _g = env_lock();
+    let td = tempfile::tempdir().unwrap();
+    std::env::set_var("TEAMS_CLI_HOME", td.path());
+    let conn = archive::connect(Some(&td.path().join("archive.sqlite3"))).unwrap();
+    archive::apply_snapshot(&conn, &snapshot(many_msgs(2, 0), vec![], vec![]), Some(1)).unwrap();
+    let bdir = paths::backups_dir();
+    let recent = bdir.join("archive-20261124-120000.sqlite3.xz");
+    fs::write(&recent, b"recent").unwrap();
+    let stale_tmp = bdir.join(".teams-backup-stale");
+    fs::create_dir(&stale_tmp).unwrap();
+    fs::write(stale_tmp.join("backup.sqlite3"), b"leftover").unwrap();
+    set_mtime_ago(&stale_tmp, Duration::from_secs(2 * 3600));
+    let fresh_tmp = bdir.join(".teams-backup-fresh");
+    fs::create_dir(&fresh_tmp).unwrap();
+    fs::write(fresh_tmp.join("backup.sqlite3"), b"active").unwrap();
+
+    assert_eq!(backups::backup_if_due(&conn, 24.0).unwrap(), None);
+    assert!(!stale_tmp.exists());
+    assert!(fresh_tmp.exists());
 }
 
 #[test]

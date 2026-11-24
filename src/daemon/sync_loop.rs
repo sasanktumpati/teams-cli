@@ -294,9 +294,35 @@ pub fn recover_interrupted_sync_runs() -> usize {
     let Ok(_lock) = sync::acquire_sync_lock(0.0) else {
         return 0;
     };
+    let has_running = match db::connect_ro(Some(&p)) {
+        Ok(ro) => {
+            let ver: i64 = ro.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+            let found = ver == archive::SCHEMA_VERSION
+                && ro
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM sync_runs WHERE status = 'running')",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    == 1;
+            db::shrink_memory(&ro);
+            found
+        }
+        Err(_) => return 0,
+    };
+    if !has_running {
+        return 0;
+    }
     let Ok(conn) = db::connect_rw(Some(&p)) else {
         return 0;
     };
+    let n = recover_interrupted_sync_runs_on_conn(&conn);
+    db::shrink_memory(&conn);
+    n
+}
+
+pub fn recover_interrupted_sync_runs_on_conn(conn: &rusqlite::Connection) -> usize {
     let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
     if ver != archive::SCHEMA_VERSION {
         return 0;
@@ -309,16 +335,27 @@ pub fn recover_interrupted_sync_runs() -> usize {
     .unwrap_or(0)
 }
 
+fn read_sqlite_header_user_version(path: &std::path::Path) -> Option<i64> {
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    if wal.metadata().is_ok_and(|m| m.len() > 0) {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 64];
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    Some(i32::from_be_bytes(hdr[60..64].try_into().ok()?) as i64)
+}
+
 pub(crate) fn ensure_migrated_in_subprocess() {
     let p = paths::archive_path();
     if !p.is_file() {
         return;
     }
-    if let Ok(conn) = archive::connect_readonly(Some(&p)) {
-        let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-        if ver == archive::SCHEMA_VERSION {
-            return;
-        }
+    if read_sqlite_header_user_version(&p) == Some(archive::SCHEMA_VERSION) {
+        return;
     }
     if let Ok(exe) = env::current_exe() {
         let mut cmd = Command::new(exe);

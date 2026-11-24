@@ -313,12 +313,14 @@ impl TeamsCache {
                     }
                 }
             } else if db_id > 0 && store_id > 0 && index_id == 1 {
-                store_records.entry((db_id, store_id)).or_default().push(RawRecord {
-                    key: suffix.to_vec(),
-                    value: val.to_vec(),
-                    seq,
-                    state,
-                });
+                if state != KeyState::Deleted {
+                    store_records.entry((db_id, store_id)).or_default().push(RawRecord {
+                        key: suffix.to_vec(),
+                        value: val.to_vec(),
+                        seq,
+                        state,
+                    });
+                }
             } else if db_id > 0 && store_id > 0 && index_id == 3 {
                 let infos = if state == KeyState::Deleted {
                     Vec::new()
@@ -459,12 +461,20 @@ impl TeamsCache {
         None
     }
 
-    fn decode_blink_value(&self, db_id: u64, store_id: u64, raw_key: &[u8], buf: &[u8]) -> Result<Value, String> {
-        self.decode_blink_value_depth(db_id, store_id, raw_key, buf, 0)
+    fn decode_blink_value(
+        &self,
+        decoder: &mut snap::raw::Decoder,
+        db_id: u64,
+        store_id: u64,
+        raw_key: &[u8],
+        buf: &[u8],
+    ) -> Result<Value, String> {
+        self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, buf, 0)
     }
 
     fn decode_blink_value_depth(
         &self,
+        decoder: &mut snap::raw::Decoder,
         db_id: u64,
         store_id: u64,
         raw_key: &[u8],
@@ -502,12 +512,12 @@ impl TeamsCache {
                     .join(format!("{:02x}", info.blob_number >> 8))
                     .join(format!("{:x}", info.blob_number));
                 let blob_bytes = fs::read(&path).map_err(|e| format!("reading blob {}: {e}", path.display()))?;
-                return self.decode_blink_value_depth(db_id, store_id, raw_key, &blob_bytes, depth + 1);
+                return self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, &blob_bytes, depth + 1);
             } else if wrap_tag == 0x02 {
-                let decompressed = snap::raw::Decoder::new()
+                let decompressed = decoder
                     .decompress_vec(&buf[pos..])
                     .map_err(|e| format!("snappy blink decompress: {e}"))?;
-                return self.decode_blink_value_depth(db_id, store_id, raw_key, &decompressed, depth + 1);
+                return self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, &decompressed, depth + 1);
             } else {
                 return Err(format!("unknown Blink wrapper tag 0x{wrap_tag:02x}"));
             }
@@ -521,17 +531,14 @@ impl TeamsCache {
         Deserializer::deserialize(&buf[pos..])
     }
 
-    pub fn raw_records_with_keys(&mut self, db_name: &str, store: &str) -> Vec<(Value, Value)> {
-        let Some(&db_id) = self.db_ids.get(db_name) else {
-            return Vec::new();
-        };
-        let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) else {
-            return Vec::new();
-        };
-        let Some(entries) = self.store_records.get(&(db_id, store_id)) else {
-            return Vec::new();
-        };
-        let mut out = Vec::with_capacity(entries.len());
+    fn decode_entries(
+        &self,
+        db_id: u64,
+        store_id: u64,
+        entries: &[RawRecord],
+        mut cb: impl FnMut(Value, Value),
+    ) -> usize {
+        let mut decoder = snap::raw::Decoder::new();
         let mut bad = 0usize;
         for rec in entries {
             if rec.state == KeyState::Deleted {
@@ -543,7 +550,7 @@ impl TeamsCache {
                 continue;
             };
             if raw_val.is_empty() {
-                out.push((idb_key.value, Value::Null));
+                cb(idb_key.value, Value::Null);
                 continue;
             }
             let mut pos = 0usize;
@@ -551,11 +558,97 @@ impl TeamsCache {
                 bad += 1;
                 continue;
             }
-            match self.decode_blink_value(db_id, store_id, &idb_key.raw_key, &raw_val[pos..]) {
-                Ok(v) => out.push((idb_key.value, v)),
+            match self.decode_blink_value(&mut decoder, db_id, store_id, &idb_key.raw_key, &raw_val[pos..]) {
+                Ok(v) => cb(idb_key.value, v),
                 Err(_) => bad += 1,
             }
         }
+        bad
+    }
+
+    fn resolve_keyed_db(&self, manager: &str, store: &str) -> Option<(u64, u64)> {
+        let pfx = format!("Teams:{manager}:");
+        let mut names: Vec<&String> = self
+            .db_ids
+            .keys()
+            .filter(|n| n.starts_with(&pfx) || *n == manager)
+            .collect();
+        names.sort_by(|a, b| {
+            let a_pref = !a.contains(":react-web-client:");
+            let b_pref = !b.contains(":react-web-client:");
+            a_pref.cmp(&b_pref).then_with(|| a.cmp(b))
+        });
+        for name in names {
+            if let Some(&db_id) = self.db_ids.get(name) {
+                if let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) {
+                    return Some((db_id, store_id));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn retain_wanted_stores(&mut self, direct: &[(&str, &str)], keyed: &[(&str, &str)]) {
+        let mut keep = std::collections::HashSet::new();
+        for &(manager, store) in direct {
+            if let Some(db_name) = self.find_database(manager) {
+                if let Some(&db_id) = self.db_ids.get(&db_name) {
+                    if let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) {
+                        keep.insert((db_id, store_id));
+                    }
+                }
+            }
+        }
+        for &(manager, store) in keyed {
+            if let Some(pair) = self.resolve_keyed_db(manager, store) {
+                keep.insert(pair);
+            }
+        }
+        self.store_records.retain(|pair, _| keep.contains(pair));
+        self.blob_lookup
+            .retain(|(db_id, store_id, _, _), _| keep.contains(&(*db_id, *store_id)));
+    }
+
+    pub fn for_each_taken_record(&mut self, manager: &str, store: &str, mut cb: impl FnMut(Value)) {
+        let Some(db_name) = self.find_database(manager) else {
+            return;
+        };
+        let Some(&db_id) = self.db_ids.get(&db_name) else {
+            return;
+        };
+        let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) else {
+            return;
+        };
+        let Some(entries) = self.store_records.remove(&(db_id, store_id)) else {
+            return;
+        };
+        let bad = self.decode_entries(db_id, store_id, &entries, |_, v| cb(v));
+        self.bad_records += bad;
+    }
+
+    pub fn for_each_taken_keyed_record(&mut self, manager: &str, store: &str, cb: impl FnMut(Value, Value)) {
+        let Some((db_id, store_id)) = self.resolve_keyed_db(manager, store) else {
+            return;
+        };
+        let Some(entries) = self.store_records.remove(&(db_id, store_id)) else {
+            return;
+        };
+        let bad = self.decode_entries(db_id, store_id, &entries, cb);
+        self.bad_records += bad;
+    }
+
+    pub fn raw_records_with_keys(&mut self, db_name: &str, store: &str) -> Vec<(Value, Value)> {
+        let Some(&db_id) = self.db_ids.get(db_name) else {
+            return Vec::new();
+        };
+        let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) else {
+            return Vec::new();
+        };
+        let Some(entries) = self.store_records.get(&(db_id, store_id)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        let bad = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
         self.bad_records += bad;
         out
     }
@@ -571,23 +664,15 @@ impl TeamsCache {
     }
 
     pub fn keyed_records(&mut self, manager: &str, store: &str) -> Vec<(Value, Value)> {
-        let pfx = format!("Teams:{manager}:");
-        let mut names: Vec<String> = self
-            .db_ids
-            .keys()
-            .filter(|n| n.starts_with(&pfx) || *n == manager)
-            .cloned()
-            .collect();
-        names.sort_by(|a, b| {
-            let a_pref = !a.contains(":react-web-client:");
-            let b_pref = !b.contains(":react-web-client:");
-            a_pref.cmp(&b_pref).then_with(|| a.cmp(b))
-        });
-        for name in names {
-            if self.stores(&name).iter().any(|s| s == store) {
-                return self.raw_records_with_keys(&name, store);
-            }
-        }
-        Vec::new()
+        let Some((db_id, store_id)) = self.resolve_keyed_db(manager, store) else {
+            return Vec::new();
+        };
+        let Some(entries) = self.store_records.get(&(db_id, store_id)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        let bad = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
+        self.bad_records += bad;
+        out
     }
 }

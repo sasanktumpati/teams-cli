@@ -20,7 +20,7 @@ use auth::{ApiToken, UNAUTHORIZED_MESSAGE};
 use http::{HttpRequest, LoopbackListener};
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -30,7 +30,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, TrySendError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -417,7 +416,73 @@ impl DaemonHandle {
 }
 
 pub fn start(port: u16, sync: Option<SyncConfig>, log_to_file: bool) -> Result<DaemonHandle, String> {
-    start_inner(port, sync, log_to_file, false)
+    start_inner(port, sync, log_to_file, false, true)
+}
+
+struct WorkerPoolState {
+    queue: VecDeque<TcpStream>,
+    active_workers: usize,
+    idle_workers: usize,
+    next_id: usize,
+    shutting_down: bool,
+}
+
+fn spawn_http_worker(
+    worker_id: usize,
+    shared: Arc<(Mutex<WorkerPoolState>, Condvar)>,
+    pool: Arc<ReadConnPool>,
+    token: Arc<ApiToken>,
+    syncer: Option<Arc<SyncCoordinator>>,
+    log_to_file: bool,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("teams-http-{worker_id}"))
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(move || loop {
+            let stream = {
+                let (m, cv) = &*shared;
+                let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if let Some(s) = st.queue.pop_front() {
+                        break Some(s);
+                    }
+                    if st.shutting_down {
+                        st.active_workers = st.active_workers.saturating_sub(1);
+                        break None;
+                    }
+                    st.idle_workers += 1;
+                    let (guard, timeout) = cv.wait_timeout(st, IDLE_CONN_TTL).unwrap_or_else(|p| p.into_inner());
+                    st = guard;
+                    st.idle_workers = st.idle_workers.saturating_sub(1);
+                    if st.queue.is_empty() && (st.shutting_down || timeout.timed_out()) {
+                        st.active_workers = st.active_workers.saturating_sub(1);
+                        break None;
+                    }
+                }
+            };
+            let Some(stream) = stream else {
+                break;
+            };
+            if let Ok(Some(req)) = http::read_request(stream) {
+                handle(req, &pool, syncer.as_ref(), &token, log_to_file);
+            }
+        })
+}
+
+fn write_busy_response(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let e = ApiError::with_status("busy", "Server is busy; retry shortly.", 503);
+    let body = json_codec::to_string(&e.to_json());
+    let resp = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Cache-Control: no-store\r\n\
+         Server: teams-cli/{VERSION}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
 }
 
 fn start_inner(
@@ -425,6 +490,7 @@ fn start_inner(
     sync: Option<SyncConfig>,
     log_to_file: bool,
     fast_change_check: bool,
+    recover_in_process: bool,
 ) -> Result<DaemonHandle, String> {
     let listener = LoopbackListener::bind(port).map_err(|e| format!("failed binding 127.0.0.1:{port}: {e}"))?;
     let bound = listener.addr();
@@ -436,13 +502,15 @@ fn start_inner(
     let pool = Arc::new(ReadConnPool::new(2));
     if sync.is_some() {
         SYNC_CANCELLED.store(false, Ordering::SeqCst);
-        let n = recover_interrupted_sync_runs();
-        if n > 0 {
-            log_line(
-                log_to_file,
-                "WARNING",
-                &format!("marked {n} interrupted sync run(s) as error"),
-            );
+        if recover_in_process {
+            let n = recover_interrupted_sync_runs();
+            if n > 0 {
+                log_line(
+                    log_to_file,
+                    "WARNING",
+                    &format!("marked {n} interrupted sync run(s) as error"),
+                );
+            }
         }
     }
 
@@ -457,44 +525,23 @@ fn start_inner(
     let stop_http = Arc::clone(&stop);
     let syncer_http = syncer.clone();
     let pool_http = Arc::clone(&pool);
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
-    let rx = Arc::new(Mutex::new(rx));
-    let mut workers = Vec::with_capacity(HTTP_WORKERS);
-    for i in 0..HTTP_WORKERS {
-        let rx_w = Arc::clone(&rx);
-        let pool_w = Arc::clone(&pool_http);
-        let token_w = Arc::clone(&token);
-        let syncer_w = syncer_http.clone();
-        match thread::Builder::new()
-            .name(format!("teams-http-{i}"))
-            .stack_size(WORKER_STACK_SIZE)
-            .spawn(move || loop {
-                let next = rx_w.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                match next {
-                    Ok(stream) => {
-                        if let Ok(Some(req)) = http::read_request(stream) {
-                            handle(req, &pool_w, syncer_w.as_ref(), &token_w, log_to_file);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }) {
-            Ok(h) => workers.push(h),
-            Err(e) => {
-                drop(tx);
-                for w in workers {
-                    let _ = w.join();
-                }
-                return Err(format!("failed spawning HTTP worker: {e}"));
-            }
-        }
-    }
+    let worker_pool = Arc::new((
+        Mutex::new(WorkerPoolState {
+            queue: VecDeque::new(),
+            active_workers: 0,
+            idle_workers: 0,
+            next_id: 0,
+            shutting_down: false,
+        }),
+        Condvar::new(),
+    ));
 
     let mut threads = Vec::with_capacity(2);
     let accept_thread = thread::Builder::new()
         .name("teams-accept".to_string())
         .stack_size(WORKER_STACK_SIZE)
         .spawn(move || {
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             while !stop_http.load(Ordering::SeqCst) {
                 let stream = match listener.accept() {
                     Ok(s) => s,
@@ -510,27 +557,52 @@ fn start_inner(
                     drop(stream);
                     break;
                 }
-                match tx.try_send(stream) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(mut stream)) => {
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                        let e = ApiError::with_status("busy", "Server is busy; retry shortly.", 503);
-                        let body = json_codec::to_string(&e.to_json());
-                        let resp = format!(
-                            "HTTP/1.1 503 Service Unavailable\r\n\
-                             Content-Type: application/json; charset=utf-8\r\n\
-                             Cache-Control: no-store\r\n\
-                             Server: teams-cli/{VERSION}\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
+                workers.retain(|h| !h.is_finished());
+                let spawn_id = {
+                    let (m, cv) = &*worker_pool;
+                    let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.queue.len() >= HTTP_QUEUE_DEPTH {
+                        drop(st);
+                        write_busy_response(stream);
+                        continue;
                     }
-                    Err(TrySendError::Disconnected(_)) => break,
+                    st.queue.push_back(stream);
+                    let id = if st.idle_workers == 0 && st.active_workers < HTTP_WORKERS {
+                        st.active_workers += 1;
+                        let wid = st.next_id;
+                        st.next_id = st.next_id.wrapping_add(1);
+                        Some(wid)
+                    } else {
+                        None
+                    };
+                    cv.notify_one();
+                    id
+                };
+                if let Some(wid) = spawn_id {
+                    match spawn_http_worker(
+                        wid,
+                        Arc::clone(&worker_pool),
+                        Arc::clone(&pool_http),
+                        Arc::clone(&token),
+                        syncer_http.clone(),
+                        log_to_file,
+                    ) {
+                        Ok(h) => workers.push(h),
+                        Err(e) => {
+                            let (m, _) = &*worker_pool;
+                            let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+                            st.active_workers = st.active_workers.saturating_sub(1);
+                            log_line(log_to_file, "ERROR", &format!("failed spawning HTTP worker: {e}"));
+                        }
+                    }
                 }
             }
-            drop(tx);
+            {
+                let (m, cv) = &*worker_pool;
+                let mut st = m.lock().unwrap_or_else(|p| p.into_inner());
+                st.shutting_down = true;
+                cv.notify_all();
+            }
             for w in workers {
                 let _ = w.join();
             }
@@ -611,7 +683,7 @@ pub fn serve(port_opt: Option<u16>, interval: u64, sync: bool, log_to_file: bool
         runner: Arc::new(run_sync_subprocess) as SyncRunner,
         interval: Some(interval),
     });
-    let handle = start_inner(port, cfg, log_to_file, true)?;
+    let handle = start_inner(port, cfg, log_to_file, true, !sync)?;
     log_line(
         log_to_file,
         "INFO",

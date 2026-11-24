@@ -203,11 +203,68 @@ fn drift_warning(prev: Option<&archive::SyncRun>, stats: &Map<String, Value>) ->
     None
 }
 
+fn sync_snapshot_into_archive(
+    conn: &rusqlite::Connection,
+    source: &Path,
+    attempts: usize,
+    wait_secs: u64,
+) -> Result<(archive::ApplyCacheResult, String), String> {
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        if let Some(e) = cache_missing_error(source) {
+            return Err(e.to_string());
+        }
+        let before = source_fingerprint(source);
+        let check = || -> Result<(), SourceError> {
+            if source_fingerprint(source) != before {
+                return Err(SourceError(format!(
+                    "Teams wrote to its cache during the copy (attempt {attempt}/{attempts})"
+                )));
+            }
+            Ok(())
+        };
+        match TeamsCache::open(Some(source), Some(check)) {
+            Ok(mut cache) => match archive::apply_cache(conn, &mut cache, None) {
+                Ok(res) => return Ok((res, before)),
+                Err(archive::ApplyCacheError::Archive(e)) => return Err(e.to_string()),
+                Err(archive::ApplyCacheError::Source(e)) => {
+                    if let Some(missing) = cache_missing_error(source) {
+                        return Err(missing.to_string());
+                    }
+                    if attempt == attempts {
+                        return Err(format!(
+                            "Could not take a consistent snapshot of the Teams cache after {attempts} attempts: {}",
+                            e.0
+                        ));
+                    }
+                    let backoff = wait_secs.saturating_mul(1u64 << (attempt - 1).min(16));
+                    thread::sleep(Duration::from_secs(backoff));
+                }
+            },
+            Err(e) => {
+                if let Some(missing) = cache_missing_error(source) {
+                    return Err(missing.to_string());
+                }
+                if attempt == attempts {
+                    return Err(format!(
+                        "Could not take a consistent snapshot of the Teams cache after {attempts} attempts: {}",
+                        e.0
+                    ));
+                }
+                let backoff = wait_secs.saturating_mul(1u64 << (attempt - 1).min(16));
+                thread::sleep(Duration::from_secs(backoff));
+            }
+        }
+    }
+    Err("Failed to snapshot Teams cache".to_string())
+}
+
 pub fn run_sync(source: Option<&Path>, notify: bool, force: bool) -> Result<Value, String> {
     let src = source.map(|p| p.to_path_buf()).unwrap_or_else(paths::source_dir);
     let _lock = acquire_sync_lock(120.0).map_err(|e| e.to_string())?;
     cleanup_stale_temp_dirs(&std::env::temp_dir(), Duration::from_secs(3600));
     let conn = archive::connect(None).map_err(|e| e.to_string())?;
+    let _ = crate::daemon::sync_loop::recover_interrupted_sync_runs_on_conn(&conn);
     let prev = archive::last_run(&conn, true);
     let fp = source_fingerprint(&src);
 
@@ -233,15 +290,14 @@ pub fn run_sync(source: Option<&Path>, notify: bool, force: bool) -> Result<Valu
     let run_id = archive::start_run(&conn, &src.to_string_lossy()).map_err(|e| e.to_string())?;
     let t0 = Instant::now();
     let res = (|| -> Result<Map<String, Value>, String> {
-        let (snap, used_fp) = take_snapshot(&src, 4, 3).map_err(|e| e.to_string())?;
-        let merged = archive::apply_snapshot(&conn, &snap, None).map_err(|e| e.to_string())?;
+        let (applied, used_fp) = sync_snapshot_into_archive(&conn, &src, 4, 3)?;
         db::optimize(&conn);
         let _ = db::wal_checkpoint(&conn, "TRUNCATE");
         let mut stats = Map::new();
-        for (k, v) in merged {
+        for (k, v) in applied.merged {
             stats.insert(k, json!(v));
         }
-        for (k, v) in snap.stats {
+        for (k, v) in applied.cache_stats {
             stats.insert(k, json!(v));
         }
         if let Ok(n) = archive::rerender(&conn, false) {

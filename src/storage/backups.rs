@@ -22,6 +22,7 @@ pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TMP_PREFIX: &str = ".teams-backup-";
 const VERIFY_TMP_PREFIX: &str = "teams-cli-verify-";
 const BEFORE_RESTORE_PREFIX: &str = "archive-before-restore-";
+const BEFORE_MIGRATE_PREFIX: &str = "archive-before-v";
 const STALE_TMP_SECONDS: u64 = 3600;
 const MAX_REPORTED_BAD_RECORDS: usize = 20;
 const CORE_TABLES: &[&str] = &["messages", "conversations", "people", "meta", "sync_runs"];
@@ -31,7 +32,10 @@ fn is_backup_name(name: &str) -> bool {
 }
 
 pub fn is_scheduled_backup(name: &str) -> bool {
-    name.starts_with("archive-") && is_backup_name(name) && !name.starts_with(BEFORE_RESTORE_PREFIX)
+    name.starts_with("archive-")
+        && is_backup_name(name)
+        && !name.starts_with(BEFORE_RESTORE_PREFIX)
+        && !name.starts_with(BEFORE_MIGRATE_PREFIX)
 }
 
 fn io_err(e: std::io::Error) -> ArchiveError {
@@ -294,6 +298,8 @@ pub fn remove_stale_verify_dirs(tmp: Option<&Path>) -> usize {
 
 pub fn backup_if_due(conn: &Connection, every_hours: f64) -> Result<Option<PathBuf>, ArchiveError> {
     let d = paths::backups_dir();
+    remove_stale_partials(&d);
+    remove_stale_verify_dirs(None);
     let scheduled: Vec<PathBuf> = list_backups(Some(&d))
         .into_iter()
         .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(is_scheduled_backup))
@@ -307,8 +313,6 @@ pub fn backup_if_due(conn: &Connection, every_hours: f64) -> Result<Option<PathB
             return Ok(None);
         }
     }
-    remove_stale_partials(&d);
-    remove_stale_verify_dirs(None);
     let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))? as u64;
     let psize: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))? as u64;
     let size = pages.saturating_mul(psize);

@@ -5,6 +5,7 @@ use crate::storage::{archive, db};
 use crate::timeutil::{iso, to_ms};
 use rusqlite::{params_from_iter, types::Value as SqlVal, Connection};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 pub const MENTIONS: &str = "streams-replychain-manager/mentions";
@@ -44,22 +45,25 @@ fn latest(conn: &Connection, sources: &[&str]) -> Result<Vec<LatestRecord>, ApiE
     Ok(out)
 }
 
-fn as_obj(v: Option<&Value>) -> Option<Map<String, Value>> {
+fn as_obj<'a>(v: Option<&'a Value>) -> Option<Cow<'a, Map<String, Value>>> {
     match v? {
-        Value::Object(m) => Some(m.clone()),
-        Value::String(s) if s.starts_with('{') => serde_json::from_str::<Value>(s).ok()?.as_object().cloned(),
+        Value::Object(m) => Some(Cow::Borrowed(m)),
+        Value::String(s) if s.starts_with('{') => match serde_json::from_str::<Value>(s).ok()? {
+            Value::Object(m) => Some(Cow::Owned(m)),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn as_arr(v: Option<&Value>) -> Vec<Value> {
+fn as_arr<'a>(v: Option<&'a Value>) -> Cow<'a, [Value]> {
     match v {
-        Some(Value::Array(a)) => a.clone(),
-        Some(Value::String(s)) if s.starts_with('[') => serde_json::from_str::<Value>(s)
-            .ok()
-            .and_then(|x| x.as_array().cloned())
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        Some(Value::Array(a)) => Cow::Borrowed(a.as_slice()),
+        Some(Value::String(s)) if s.starts_with('[') => match serde_json::from_str::<Value>(s).ok() {
+            Some(Value::Array(a)) => Cow::Owned(a),
+            _ => Cow::Borrowed(&[]),
+        },
+        _ => Cow::Borrowed(&[]),
     }
 }
 
@@ -215,10 +219,17 @@ fn fetch_archived_msgs(
 fn render_raw_msg(m: &Map<String, Value>, look: &Lookup) -> String {
     let mtype = non_empty_str(m.get("messageType")).unwrap_or_else(|| "RichText/Html".to_string());
     let content = non_empty_str(m.get("content")).unwrap_or_default();
-    let props = as_obj(m.get("properties"))
-        .map(Value::Object)
-        .unwrap_or_else(|| json!({}));
-    render_text(&mtype, &content, &props, &|mri| look.name_of(mri)).1
+    let owned_props;
+    let props_ref: &Value = match m.get("properties") {
+        Some(v @ Value::Object(_)) => v,
+        other => {
+            owned_props = as_obj(other)
+                .map(|c| Value::Object(c.into_owned()))
+                .unwrap_or_else(|| json!({}));
+            &owned_props
+        }
+    };
+    render_text(&mtype, &content, props_ref, &|mri| look.name_of(mri)).1
 }
 
 fn page_items(mut items: Vec<Value>, key: &str, limit: usize) -> (Vec<Value>, usize) {
@@ -547,7 +558,7 @@ pub fn read_state(conn: &Connection) -> Result<HashMap<String, ConvReadState>, A
     for (_, key, data) in latest(conn, &[HORIZON_HISTORY])? {
         let Some(d) = as_obj(Some(&data)) else { continue };
         let cid = non_empty_str(d.get("conversationId")).unwrap_or(key);
-        for h in as_arr(d.get("historyRecords")) {
+        for h in as_arr(d.get("historyRecords")).iter() {
             let after = as_obj(h.get("afterUpdate")).unwrap_or_default();
             let t = archive::horizon_first(after.get("consumptionHorizon"));
             let cur_t = best.get(&cid).map(|x| x.0).unwrap_or(0);
@@ -991,14 +1002,12 @@ pub fn calls(
         let targ = participant_json(d.get("targetParticipant"), &look);
         let mut participants = Vec::new();
         let mut seen = HashSet::new();
-        let mut raw_parts = as_arr(d.get("participantList"));
-        if let Some(v) = d.get("originatorParticipant") {
-            raw_parts.push(v.clone());
-        }
-        if let Some(v) = d.get("targetParticipant") {
-            raw_parts.push(v.clone());
-        }
-        for rp in &raw_parts {
+        let raw_parts = as_arr(d.get("participantList"));
+        for rp in raw_parts
+            .iter()
+            .chain(d.get("originatorParticipant"))
+            .chain(d.get("targetParticipant"))
+        {
             if let Some((pid, pname)) = participant_json(Some(rp), &look) {
                 let k = pid.clone().or_else(|| pname.clone()).unwrap_or_default();
                 if seen.insert(k) {
@@ -1084,8 +1093,8 @@ pub fn meetings(
             }
         }
         let mut attendees = Vec::new();
-        for av in as_arr(d.get("attendees")) {
-            let Some(a) = as_obj(Some(&av)) else { continue };
+        for av in as_arr(d.get("attendees")).iter() {
+            let Some(a) = as_obj(Some(av)) else { continue };
             let resp = as_obj(a.get("status"))
                 .and_then(|s| non_empty_str(s.get("response")))
                 .or_else(|| non_empty_str(a.get("status")));
@@ -1244,15 +1253,15 @@ pub fn pinned(conn: &Connection, chat: Option<&str>, limit: usize) -> Result<Val
         let Some(d) = as_obj(Some(&data)) else { continue };
         let mut records = Vec::new();
         if non_empty_str(d.get("conversationId")).is_some() && d.get("id").map(|v| !v.is_null()).unwrap_or(false) {
-            records.push(d);
+            records.push(d.into_owned());
         } else {
             for v in d.values() {
-                for item in as_arr(Some(v)) {
-                    if let Some(x) = as_obj(Some(&item)) {
+                for item in as_arr(Some(v)).iter() {
+                    if let Some(x) = as_obj(Some(item)) {
                         if non_empty_str(x.get("conversationId")).is_some()
                             && x.get("id").map(|v| !v.is_null()).unwrap_or(false)
                         {
-                            records.push(x);
+                            records.push(x.into_owned());
                         }
                     }
                 }

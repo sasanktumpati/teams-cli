@@ -46,22 +46,48 @@ fn read_block_handle(buf: &[u8], pos: &mut usize) -> Option<(u64, u64)> {
     Some((offset, length))
 }
 
-fn read_ldb_block(decoder: &mut snap::raw::Decoder, file_data: &[u8], offset: u64, length: u64) -> Option<Vec<u8>> {
-    let start = usize::try_from(offset).ok()?;
-    let len = usize::try_from(length).ok()?;
-    let end = start.checked_add(len)?;
-    let trailer_end = end.checked_add(LDB_BLOCK_TRAILER_SIZE)?;
+fn read_ldb_block_into(
+    decoder: &mut snap::raw::Decoder,
+    file_data: &[u8],
+    offset: u64,
+    length: u64,
+    out: &mut Vec<u8>,
+) -> bool {
+    let Some(start) = usize::try_from(offset).ok() else {
+        return false;
+    };
+    let Some(len) = usize::try_from(length).ok() else {
+        return false;
+    };
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let Some(trailer_end) = end.checked_add(LDB_BLOCK_TRAILER_SIZE) else {
+        return false;
+    };
     if trailer_end > file_data.len() {
-        return None;
+        return false;
     }
     let raw = &file_data[start..end];
     let comp_type = file_data[end];
+    out.clear();
     if comp_type == 0 {
-        Some(raw.to_vec())
+        out.extend_from_slice(raw);
+        true
     } else if comp_type == 1 {
-        decoder.decompress_vec(raw).ok()
+        let Ok(decomp_len) = snap::raw::decompress_len(raw) else {
+            return false;
+        };
+        out.resize(decomp_len, 0);
+        match decoder.decompress(raw, out) {
+            Ok(n) => {
+                out.truncate(n);
+                true
+            }
+            Err(_) => false,
+        }
     } else {
-        None
+        false
     }
 }
 
@@ -133,9 +159,10 @@ fn scan_ldb_file(path: &Path, decoder: &mut snap::raw::Decoder, cb: &mut impl Fn
     let Some((idx_off, idx_len)) = read_block_handle(footer, &mut fpos) else {
         return;
     };
-    let Some(idx_block) = read_ldb_block(decoder, &data, idx_off, idx_len) else {
+    let mut idx_block = Vec::new();
+    if !read_ldb_block_into(decoder, &data, idx_off, idx_len, &mut idx_block) {
         return;
-    };
+    }
     let mut handles: Vec<(u64, u64)> = Vec::new();
     iter_block_entries(&idx_block, |_k, v| {
         let mut p = 0;
@@ -143,10 +170,12 @@ fn scan_ldb_file(path: &Path, decoder: &mut snap::raw::Decoder, cb: &mut impl Fn
             handles.push(h);
         }
     });
+    drop(idx_block);
+    let mut block = Vec::new();
     for (off, len) in handles {
-        let Some(block) = read_ldb_block(decoder, &data, off, len) else {
+        if !read_ldb_block_into(decoder, &data, off, len, &mut block) {
             continue;
-        };
+        }
         iter_block_entries(&block, |raw_key, val| {
             let (user_key, seq, state) = if raw_key.len() >= 8 {
                 let tag = u64::from_le_bytes(raw_key[raw_key.len() - 8..].try_into().unwrap());
@@ -169,13 +198,60 @@ fn scan_ldb_file(path: &Path, decoder: &mut snap::raw::Decoder, cb: &mut impl Fn
     }
 }
 
+fn emit_log_batch(batch: &[u8], cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) {
+    if batch.len() < 12 {
+        return;
+    }
+    let seq = u64::from_le_bytes(batch[0..8].try_into().unwrap());
+    let count = u32::from_le_bytes(batch[8..12].try_into().unwrap());
+    let mut pos = 12usize;
+    for i in 0..count {
+        if pos >= batch.len() {
+            break;
+        }
+        let state = match batch[pos] {
+            0 => KeyState::Deleted,
+            1 => KeyState::Live,
+            _ => break,
+        };
+        pos += 1;
+        let Some(klen) = read_varint(batch, &mut pos).and_then(|v| usize::try_from(v).ok()) else {
+            break;
+        };
+        let Some(kend) = pos.checked_add(klen) else {
+            break;
+        };
+        if kend > batch.len() {
+            break;
+        }
+        let key = &batch[pos..kend];
+        pos = kend;
+        let val: &[u8] = if state != KeyState::Deleted {
+            let Some(vlen) = read_varint(batch, &mut pos).and_then(|v| usize::try_from(v).ok()) else {
+                break;
+            };
+            let Some(vend) = pos.checked_add(vlen) else {
+                break;
+            };
+            if vend > batch.len() {
+                break;
+            }
+            let v = &batch[pos..vend];
+            pos = vend;
+            v
+        } else {
+            &[]
+        };
+        cb(key, val, seq.saturating_add(i as u64), state);
+    }
+}
+
 fn scan_log_file(path: &Path, cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) {
     let Ok(data) = fs::read(path) else {
         return;
     };
     let mut in_record = false;
     let mut fragments: Vec<u8> = Vec::new();
-    let mut batches: Vec<Vec<u8>> = Vec::new();
 
     for block in data.chunks(LOG_BLOCK_SIZE) {
         let mut pos = 0usize;
@@ -200,7 +276,7 @@ fn scan_log_file(path: &Path, cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) 
                 1 => {
                     in_record = false;
                     fragments.clear();
-                    batches.push(payload.to_vec());
+                    emit_log_batch(payload, cb);
                 }
                 2 => {
                     in_record = true;
@@ -215,7 +291,8 @@ fn scan_log_file(path: &Path, cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) 
                 4 => {
                     if in_record {
                         fragments.extend_from_slice(payload);
-                        batches.push(std::mem::take(&mut fragments));
+                        emit_log_batch(&fragments, cb);
+                        fragments.clear();
                         in_record = false;
                     }
                 }
@@ -224,54 +301,6 @@ fn scan_log_file(path: &Path, cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) 
                     fragments.clear();
                 }
             }
-        }
-    }
-
-    for batch in batches {
-        if batch.len() < 12 {
-            continue;
-        }
-        let seq = u64::from_le_bytes(batch[0..8].try_into().unwrap());
-        let count = u32::from_le_bytes(batch[8..12].try_into().unwrap());
-        let mut pos = 12usize;
-        for i in 0..count {
-            if pos >= batch.len() {
-                break;
-            }
-            let state = match batch[pos] {
-                0 => KeyState::Deleted,
-                1 => KeyState::Live,
-                _ => break,
-            };
-            pos += 1;
-            let Some(klen) = read_varint(&batch, &mut pos).and_then(|v| usize::try_from(v).ok()) else {
-                break;
-            };
-            let Some(kend) = pos.checked_add(klen) else {
-                break;
-            };
-            if kend > batch.len() {
-                break;
-            }
-            let key = &batch[pos..kend];
-            pos = kend;
-            let val: &[u8] = if state != KeyState::Deleted {
-                let Some(vlen) = read_varint(&batch, &mut pos).and_then(|v| usize::try_from(v).ok()) else {
-                    break;
-                };
-                let Some(vend) = pos.checked_add(vlen) else {
-                    break;
-                };
-                if vend > batch.len() {
-                    break;
-                }
-                let v = &batch[pos..vend];
-                pos = vend;
-                v
-            } else {
-                &[]
-            };
-            cb(key, val, seq.saturating_add(i as u64), state);
         }
     }
 }
