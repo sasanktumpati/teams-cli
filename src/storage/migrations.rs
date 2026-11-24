@@ -89,6 +89,14 @@ pub const MIGRATIONS: &[Migration] = &[
         needs_vacuum_on_upgrade: false,
         apply: up_v8,
     },
+    Migration {
+        version: 9,
+        name: "compact_raw_and_ephemeral_storage",
+        description:
+            "Drop redundant sender index, clear duplicated raw JSON columns, and compact ephemeral record_versions",
+        needs_vacuum_on_upgrade: true,
+        apply: up_v9,
+    },
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -645,6 +653,29 @@ fn up_v8(conn: &Connection) -> Result<(), ArchiveError> {
     for m in MIGRATIONS.iter().filter(|m| m.version < 8) {
         ins.execute(params![m.version, m.name])?;
     }
+    Ok(())
+}
+
+fn up_v9(conn: &Connection) -> Result<(), ArchiveError> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS messages_by_sender;
+         UPDATE messages SET raw = NULL WHERE raw IS NOT NULL;
+         UPDATE conversations SET raw = NULL WHERE raw IS NOT NULL;
+         UPDATE people SET raw = NULL WHERE raw IS NOT NULL;
+         DELETE FROM record_versions
+          WHERE source IN (
+             'streams-replychain-manager/drafts',
+             'consumption-horizon-manager/consumption-horizon-history'
+          )
+            AND id NOT IN (
+             SELECT MAX(id) FROM record_versions
+              WHERE source IN (
+                 'streams-replychain-manager/drafts',
+                 'consumption-horizon-manager/consumption-horizon-history'
+              )
+              GROUP BY source, record_key
+          );",
+    )?;
     Ok(())
 }
 

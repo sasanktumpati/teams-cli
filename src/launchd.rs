@@ -72,6 +72,7 @@ pub fn install(interval: u64, port_opt: Option<u16>) -> Result<PathBuf, String> 
 	<array>
 		<string>{exe}</string>
 		<string>daemon</string>
+		<string>run</string>
 		<string>--interval</string>
 		<string>{interval}</string>
 		<string>--port</string>
@@ -208,6 +209,16 @@ pub fn restart() -> Result<PathBuf, String> {
     let path = plist_path();
     if !path.exists() {
         return install(paths::DEFAULT_SYNC_INTERVAL, None);
+    }
+    if let Ok(text) = fs::read_to_string(&path) {
+        let old = "<string>daemon</string>\n\t\t<string>--interval</string>";
+        if text.contains(old) {
+            let updated = text.replace(
+                old,
+                "<string>daemon</string>\n\t\t<string>run</string>\n\t\t<string>--interval</string>",
+            );
+            let _ = write_plist_atomic(&path, &updated);
+        }
     }
     if !stop(10.0) {
         return Err(format!(

@@ -386,7 +386,20 @@ pub fn build_archive(home: &Path) -> Connection {
 }
 
 pub fn api_token() -> String {
-    teams_cli::daemon::load_or_create_api_token().unwrap()
+    static CACHED: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+    let home = teams_cli::paths::home();
+    let store = teams_cli::paths::api_tokens_path();
+    let mut guard = CACHED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((ref cached_home, ref tok)) = *guard {
+        if *cached_home == home && store.is_file() {
+            return tok.clone();
+        }
+    }
+    let _ = teams_cli::daemon::revoke_named_token("test-harness");
+    let created = teams_cli::daemon::create_named_token("test-harness", None).unwrap();
+    let tok = created["token"].as_str().unwrap().to_string();
+    *guard = Some((home, tok.clone()));
+    tok
 }
 
 pub fn bearer() -> String {

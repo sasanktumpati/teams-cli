@@ -167,15 +167,15 @@ fn search_count_and_history() {
 #[test]
 fn person() {
     let (_td, h) = home();
-    let o = teams(&h, &["person", "Ada", "Lovelace"]);
+    let o = teams(&h, &["people", "Ada", "Lovelace"]);
     assert_eq!(o.code, 0);
     for s in ["Ada Lovelace", "ada@corp.test", "Launch crew"] {
         assert!(o.out.contains(s), "{s}");
     }
-    let r = teams_json(&h, &["person", "ada@corp.test"]);
+    let r = teams_json(&h, &["people", "ada@corp.test"]);
     assert_eq!(r["person"]["id"], ADA);
     assert_eq!(r["person"]["messagesInArchive"], 8);
-    let o = teams(&h, &["person", "nobody-here"]);
+    let o = teams(&h, &["people", "nobody-here"]);
     assert_eq!(o.code, 2);
     assert!(o.err.contains("No person"), "{}", o.err);
 }
@@ -259,7 +259,7 @@ fn status_changes_records_people_attachments_json() {
         ch["changes"].as_array().unwrap().iter().any(|c| c["id"] == EDITED),
         "{ch}"
     );
-    let src = teams_json(&h, &["records"]);
+    let src = teams_json(&h, &["debug", "records"]);
     assert!(src.to_string().contains(CALLS), "{src}");
     let p = teams_json(&h, &["people", "--grep", "ada"]);
     assert_eq!(p["people"][0]["id"], ADA);
@@ -288,15 +288,15 @@ fn export_stdout_and_private_file() {
 #[test]
 fn verify() {
     let (td, h) = home();
-    let o = teams(&h, &["verify", "--no-backups"]);
+    let o = teams(&h, &["archive", "verify", "--no-backups"]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(o.out.starts_with("OK") && o.out.contains("integrity"), "{}", o.out);
-    let r = teams_json(&h, &["verify"]);
+    let r = teams_json(&h, &["archive", "verify"]);
     assert_eq!(r["ok"], true);
     assert_eq!(r["errors"], serde_json::json!([]));
     let bad = td.path().join("bad.sqlite3");
     std::fs::write(&bad, b"not a database".repeat(100)).unwrap();
-    let o = teams(&h, &["verify", bad.to_str().unwrap()]);
+    let o = teams(&h, &["archive", "verify", bad.to_str().unwrap()]);
     assert_eq!(o.code, 1);
     assert!(
         o.out.starts_with("FAILED") && !o.err.is_empty(),
@@ -310,14 +310,14 @@ fn verify() {
 fn backup_then_restore_dry_run_and_damaged_backup() {
     let (td, h) = home();
     let dest = td.path().join("snap.sqlite3.xz");
-    let o = teams(&h, &["backup", "--out", dest.to_str().unwrap()]);
+    let o = teams(&h, &["archive", "backup", "--out", dest.to_str().unwrap()]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
 
-    let o = teams(&h, &["restore", dest.to_str().unwrap()]);
+    let o = teams(&h, &["archive", "restore", dest.to_str().unwrap()]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(o.out.contains("--yes") && o.out.contains("verified OK"), "{}", o.out);
-    let r = teams_json(&h, &["restore", dest.to_str().unwrap()]);
+    let r = teams_json(&h, &["archive", "restore", dest.to_str().unwrap()]);
     assert_eq!(
         r,
         serde_json::json!({"dryRun": true, "backup": dest.to_str().unwrap(), "verified": true,
@@ -326,7 +326,7 @@ fn backup_then_restore_dry_run_and_damaged_backup() {
 
     let bad = td.path().join("bad.sqlite3");
     std::fs::write(&bad, b"garbage".repeat(200)).unwrap();
-    let o = teams(&h, &["restore", bad.to_str().unwrap(), "--yes"]);
+    let o = teams(&h, &["archive", "restore", bad.to_str().unwrap(), "--yes"]);
     assert_eq!(o.code, 1);
     assert!(o.err.contains("failed verification"), "{}", o.err);
 }
@@ -417,7 +417,7 @@ fn completions_migrations_doctor_and_interval_validation() {
         assert_eq!(o.code, 0, "{shell}: {}", o.err);
         assert!(!o.out.trim().is_empty(), "{shell}");
     }
-    let m = teams_json(&h, &["migrations"]);
+    let m = teams_json(&h, &["archive", "migrations"]);
     assert_eq!(m["currentVersion"], teams_cli::storage::archive::SCHEMA_VERSION);
     assert_eq!(m["pending"].as_array().unwrap().len(), 0);
     assert_eq!(
@@ -429,7 +429,7 @@ fn completions_migrations_doctor_and_interval_validation() {
     assert!(dv["checks"].is_array());
     assert!(!dv["checks"].as_array().unwrap().is_empty());
 
-    let bad = teams(&h, &["daemon", "--interval", "5"]);
+    let bad = teams(&h, &["daemon", "run", "--interval", "5"]);
     assert_eq!(bad.code, 2, "{}", bad.err);
     assert!(bad.err.contains("at least 10"), "{}", bad.err);
 }

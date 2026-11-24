@@ -18,7 +18,9 @@ use xz2::write::XzEncoder;
 pub const BACKUP_DAILY: usize = 7;
 pub const BACKUP_WEEKLY: usize = 4;
 pub const BACKUP_MONTHLY: usize = 6;
+pub const BACKUP_MIGRATION_KEEP: usize = 2;
 pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const XZ_COMPRESSION_LEVEL: u32 = 3;
 const TMP_PREFIX: &str = ".teams-backup-";
 const VERIFY_TMP_PREFIX: &str = "teams-cli-verify-";
 const BEFORE_RESTORE_PREFIX: &str = "archive-before-restore-";
@@ -116,7 +118,7 @@ fn compress_xz(src: &Path, dest: &Path) -> Result<(), ArchiveError> {
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| ArchiveError(e.to_string()))?;
-        let mut enc = XzEncoder::new(raw, 6);
+        let mut enc = XzEncoder::new(raw, XZ_COMPRESSION_LEVEL);
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = fin.read(&mut buf).map_err(|e| ArchiveError(e.to_string()))?;
@@ -213,16 +215,32 @@ pub fn compress_old_backups_with_warnings(dir: Option<&Path>) -> (usize, Vec<Str
     (count, warnings)
 }
 
+fn parse_migration_backup(name: &str) -> Option<(u64, DateTime)> {
+    let rest = name.strip_prefix(BEFORE_MIGRATE_PREFIX)?;
+    let (ver_s, tail) = rest.split_once('-')?;
+    let ver: u64 = ver_s.parse().ok()?;
+    let norm = format!("{}.xz", tail.strip_suffix(".xz").unwrap_or(tail));
+    let dt = timeutil::parse_datetime_fmt(&norm, "%Y%m%d-%H%M%S.sqlite3.xz")?;
+    Some((ver, dt))
+}
+
 pub fn backups_to_keep(names: &[String], daily: usize, weekly: usize, monthly: usize) -> HashSet<String> {
     let mut dated: Vec<(DateTime, String)> = Vec::new();
+    let mut migrations: Vec<(DateTime, u64, String)> = Vec::new();
     let mut keep = HashSet::new();
     for n in names {
         let norm = format!("{}.xz", n.strip_suffix(".xz").unwrap_or(n));
         if let Some(t) = timeutil::parse_datetime_fmt(&norm, "archive-%Y%m%d-%H%M%S.sqlite3.xz") {
             dated.push((t, n.clone()));
+        } else if let Some((ver, t)) = parse_migration_backup(n) {
+            migrations.push((t, ver, n.clone()));
         } else {
             keep.insert(n.clone());
         }
+    }
+    migrations.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.cmp(&a.2)));
+    for (_, _, n) in migrations.into_iter().take(BACKUP_MIGRATION_KEEP) {
+        keep.insert(n);
     }
     dated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     for (_, n) in dated.iter().take(daily) {

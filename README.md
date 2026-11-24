@@ -22,7 +22,7 @@ Then set up the archive and background daemon:
 
 ```sh
 teams sync
-teams agent install
+teams daemon install
 teams doctor
 ```
 
@@ -45,7 +45,6 @@ Run `teams docs` for the full command, flag, and JSON schema reference.
 ```sh
 teams status
 teams doctor
-teams migrations
 teams sync
 
 teams inbox
@@ -62,7 +61,7 @@ teams search --has-attachments --since 30d
 teams search --from Alice --count
 
 teams people --grep alice
-teams person alice@example.com
+teams people alice@example.com
 teams attachments --type pdf --since 30d
 teams changes --since 7d
 teams calls --missed
@@ -81,15 +80,13 @@ Exit codes: `0` ok, `1` runtime/health error, `2` usage/parameter error.
 
 ## Local HTTP API & Auth
 
-The background daemon (`teams agent install`) listens on `http://127.0.0.1:47613` (`TEAMS_CLI_PORT` to override) and checks for cache changes every 60s.
+The background daemon (`teams daemon install`) listens on `http://127.0.0.1:47613` (`TEAMS_CLI_PORT` to override) and checks for cache changes every 60s.
 
 - `GET /health` is unauthenticated.
 - All `/v1/*` routes require `Authorization: Bearer <token>` and reject non-loopback `Host`, `Origin`, and cross-site `Sec-Fetch-Site` headers.
 - All endpoints are read-only except `POST /v1/sync`. `fetch` and `send` are CLI-only (`send` requires both `TEAMS_CLI_ENABLE_SEND=1` and `--yes`).
 
 ```sh
-teams token
-teams token --rotate
 teams token create my-script --expires 30d
 teams token list
 teams token revoke my-script
@@ -97,7 +94,8 @@ teams token prune
 ```
 
 ```sh
-curl -H "Authorization: Bearer $(teams token)" http://127.0.0.1:47613/v1/status
+TOKEN=$(teams token create my-script --expires 30d)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:47613/v1/status
 ```
 
 An optional typed Executor wrapper lives in `executor-app/` (`executor-app/deploy.sh`).
@@ -105,12 +103,11 @@ An optional typed Executor wrapper lives in `executor-app/` (`executor-app/deplo
 ## Operations
 
 ```sh
-teams agent status | restart | uninstall | logs
-teams verify
-teams backup --out ~/teams-backup.sqlite3.xz
-teams restore ~/teams-backup.sqlite3.xz --yes
-teams reindex
-teams raw stores
+teams daemon status | restart | uninstall | logs [--follow] | run
+teams archive verify | migrations | reindex
+teams archive backup --out ~/teams-backup.sqlite3.xz
+teams archive restore ~/teams-backup.sqlite3.xz --yes
+teams debug stores | dump | records
 ```
 
 ## Development

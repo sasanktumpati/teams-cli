@@ -87,7 +87,6 @@ struct Fixture {
 impl Fixture {
     fn new(sync: Option<SyncConfig>) -> Self {
         let guard = env_lock();
-        std::env::remove_var(daemon::API_TOKEN_ENV);
         let (td, _home) = home_with_archive();
         let handle = daemon::start(0, sync, false).unwrap();
         Fixture {
@@ -463,31 +462,11 @@ fn v1_routes_require_a_single_valid_bearer_token() {
     assert_eq!(r.status, 403);
 }
 
-#[test]
-fn token_env_override_wins_over_the_file() {
-    let f = Fixture::new(None);
-    let file_token = api_token();
-    std::env::set_var(daemon::API_TOKEN_ENV, "  env-secret-token \n");
-    let r = f.req(
-        "GET",
-        "/v1/status",
-        &[],
-        &[("Authorization", "Bearer env-secret-token")],
-    );
-    let file_auth = format!("Bearer {file_token}");
-    let r2 = f.req("GET", "/v1/status", &[], &[("Authorization", &file_auth)]);
-    std::env::remove_var(daemon::API_TOKEN_ENV);
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(r2.status, 401);
-    assert_eq!(api_token(), file_token);
-}
-
 fn teams_token(home: &std::path::Path, args: &[&str]) -> (String, String) {
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
         .arg("token")
         .args(args)
         .env("TEAMS_CLI_HOME", home)
-        .env_remove(daemon::API_TOKEN_ENV)
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -498,39 +477,22 @@ fn teams_token(home: &std::path::Path, args: &[&str]) -> (String, String) {
 }
 
 #[test]
-fn teams_token_cli_creates_prints_and_rotates_live() {
+fn only_named_tokens_are_accepted() {
     use std::os::unix::fs::PermissionsExt;
     let _g = env_lock();
-    std::env::remove_var(daemon::API_TOKEN_ENV);
     let (td, home) = home_with_archive();
-    let path = home.join("api.token");
-    assert!(!path.exists());
+    let legacy_path = home.join("api.token");
+    std::fs::write(&legacy_path, "legacy-plaintext-secret\n").unwrap();
 
-    let (first, _) = teams_token(&home, &[]);
-    let first = first.strip_suffix('\n').expect("token ends with a newline").to_string();
-    assert_eq!(first.len(), 64, "{first:?}");
-    assert!(first.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), first);
-    assert_eq!(
-        teams_token(&home, &[]).0.trim(),
-        first,
-        "repeat call prints the same token"
-    );
-
-    let (j, _) = teams_token(&home, &["--json"]);
-    let j: Value = serde_json::from_str(&j).unwrap();
-    assert_eq!(
-        j,
-        json!({"token": first, "path": path.to_string_lossy(), "source": "file"})
-    );
-
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(teams_token(&home, &[]).0.trim(), first);
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let bare = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+        .arg("token")
+        .env("TEAMS_CLI_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(bare.status.code(), Some(2));
 
     let h = daemon::start(0, None, false).unwrap();
-    let auth_with = |tok: &str| {
+    let call_status = |tok: &str| {
         raw_request(
             h.addr(),
             "GET",
@@ -538,40 +500,34 @@ fn teams_token_cli_creates_prints_and_rotates_live() {
             &[("Authorization", &format!("Bearer {tok}"))],
         )
     };
-    assert_eq!(auth_with(&first).status, 200);
 
-    let (rotated, _) = teams_token(&home, &["--rotate"]);
-    let rotated = rotated.trim().to_string();
-    assert_eq!(rotated.len(), 64);
-    assert_ne!(rotated, first);
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(teams_token(&home, &[]).0.trim(), rotated);
-    let old = auth_with(&first);
-    assert_eq!(old.status, 401, "old token must stop working: {}", old.body);
-    assert_eq!(auth_with(&rotated).status, 200);
+    assert_eq!(call_status("legacy-plaintext-secret").status, 401);
 
-    let o = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
-        .args(["token", "--rotate", "--json"])
-        .env("TEAMS_CLI_HOME", &home)
-        .env(daemon::API_TOKEN_ENV, "from-env")
-        .output()
-        .unwrap();
-    assert!(o.status.success());
-    assert!(String::from_utf8_lossy(&o.stderr).contains(daemon::API_TOKEN_ENV));
-    let j: Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(j["source"], "file");
-    assert_ne!(j["token"], json!(rotated));
-    let o = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
-        .args(["token", "--json"])
-        .env("TEAMS_CLI_HOME", &home)
-        .env(daemon::API_TOKEN_ENV, " from-env ")
-        .output()
-        .unwrap();
-    let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+    std::env::set_var("TEAMS_CLI_API_TOKEN", "env-secret-token");
+    let env_res = call_status("env-secret-token");
+    std::env::remove_var("TEAMS_CLI_API_TOKEN");
+    assert_eq!(env_res.status, 401);
+
+    let (out, _) = teams_token(&home, &["create", "script", "--json"]);
+    let secret = serde_json::from_str::<Value>(&out).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(call_status(&secret).status, 200);
+
+    let store_path = home.join("api.tokens.json");
+    std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(call_status(&secret).status, 200);
     assert_eq!(
-        (j["token"].as_str(), j["source"].as_str()),
-        (Some("from-env"), Some("env"))
+        std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777,
+        0o600
     );
+
+    std::fs::write(&store_path, "{corrupt json").unwrap();
+    assert_eq!(call_status(&secret).status, 500);
+
+    std::fs::remove_file(&store_path).unwrap();
+    assert_eq!(call_status(&secret).status, 401);
 
     h.shutdown();
     drop(td);
@@ -580,10 +536,10 @@ fn teams_token_cli_creates_prints_and_rotates_live() {
 #[test]
 fn missing_archive_answers_409_empty_archive() {
     let _g = env_lock();
-    std::env::remove_var(daemon::API_TOKEN_ENV);
     let td = tempfile::tempdir().unwrap();
     std::env::set_var("TEAMS_CLI_HOME", td.path());
     let h = daemon::start(0, None, false).unwrap();
+    assert!(!td.path().join("api.token").exists());
     for path in ["/v1/status", "/v1/chats"] {
         let r = raw_request(h.addr(), "GET", path, &[]);
         assert_eq!(
@@ -594,6 +550,7 @@ fn missing_archive_answers_409_empty_archive() {
     }
     h.shutdown();
     assert!(!td.path().join("archive.sqlite3").exists());
+    assert!(!td.path().join("api.token").exists());
 }
 
 #[test]
@@ -622,9 +579,9 @@ fn bearer_token_parsing() {
 fn named_tokens_create_expiry_revoke_and_prune_live() {
     use std::os::unix::fs::PermissionsExt;
     let _g = env_lock();
-    std::env::remove_var(daemon::API_TOKEN_ENV);
     let (td, home) = home_with_archive();
     let h = daemon::start(0, None, false).unwrap();
+    assert!(!home.join("api.token").exists());
 
     let call_status = |tok: &str| {
         raw_request(
@@ -651,12 +608,10 @@ fn named_tokens_create_expiry_revoke_and_prune_live() {
     assert!(!raw_store.contains(&secret), "secret must never be stored in plaintext");
 
     assert_eq!(call_status(&secret).status, 200);
-    assert_eq!(call_status(&api_token()).status, 200);
 
     let dup = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
         .args(["token", "create", "ci-bot"])
         .env("TEAMS_CLI_HOME", &home)
-        .env_remove(daemon::API_TOKEN_ENV)
         .output()
         .unwrap();
     assert!(!dup.status.success());
@@ -667,12 +622,6 @@ fn named_tokens_create_expiry_revoke_and_prune_live() {
     let listed: Value = serde_json::from_str(&list_out).unwrap();
     assert_eq!(listed["count"], 1);
     assert_eq!(listed["tokens"][0]["name"], "ci-bot");
-
-    std::env::set_var(daemon::API_TOKEN_ENV, "env-only-secret");
-    assert_eq!(call_status(&secret).status, 401);
-    assert_eq!(call_status("env-only-secret").status, 200);
-    std::env::remove_var(daemon::API_TOKEN_ENV);
-    assert_eq!(call_status(&secret).status, 200);
 
     let (rev_out, _) = teams_token(&home, &["revoke", &id, "--json"]);
     let rev: Value = serde_json::from_str(&rev_out).unwrap();
@@ -705,7 +654,6 @@ fn named_tokens_create_expiry_revoke_and_prune_live() {
     let hex_name = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
         .args(["token", "create", "deadbeef"])
         .env("TEAMS_CLI_HOME", &home)
-        .env_remove(daemon::API_TOKEN_ENV)
         .output()
         .unwrap();
     assert!(!hex_name.status.success());
@@ -713,7 +661,6 @@ fn named_tokens_create_expiry_revoke_and_prune_live() {
     let huge_exp = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
         .args(["token", "create", "far-future", "--expires", "200y"])
         .env("TEAMS_CLI_HOME", &home)
-        .env_remove(daemon::API_TOKEN_ENV)
         .output()
         .unwrap();
     assert!(!huge_exp.status.success());
@@ -756,7 +703,6 @@ fn concurrent_post_sync_returns_409_busy_immediately() {
 #[test]
 fn daemon_returns_503_migrating_instead_of_upgrading_in_worker() {
     let _g = env_lock();
-    std::env::remove_var(daemon::API_TOKEN_ENV);
     let td = tempfile::tempdir().unwrap();
     std::env::set_var("TEAMS_CLI_HOME", td.path());
     let db_path = td.path().join("archive.sqlite3");

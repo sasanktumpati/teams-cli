@@ -67,10 +67,6 @@ pub fn archive_path() -> PathBuf {
     home().join("archive.sqlite3")
 }
 
-pub fn api_token_path() -> PathBuf {
-    home().join("api.token")
-}
-
 pub fn api_tokens_path() -> PathBuf {
     home().join("api.tokens.json")
 }

@@ -4,9 +4,8 @@ pub mod pool;
 pub mod sync_loop;
 
 pub use auth::{
-    bearer_token, create_named_token, env_api_token, extract_host, is_allowed, is_allowed_headers, list_named_tokens,
-    load_or_create_api_token, peek_api_token, prune_expired_tokens, revoke_named_token, rotate_api_token,
-    API_TOKEN_ENV,
+    bearer_token, create_named_token, extract_host, is_allowed, is_allowed_headers, list_named_tokens,
+    prune_expired_tokens, revoke_named_token,
 };
 pub use pool::{FileSig, PoolAcquireError, ReadConnPool, IDLE_CONN_TTL};
 pub use sync_loop::{recover_interrupted_sync_runs, run_sync_subprocess, SyncConfig, SyncFailure, SyncRunner};

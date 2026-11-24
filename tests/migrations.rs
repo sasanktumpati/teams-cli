@@ -126,14 +126,16 @@ fn fresh_archive_is_current_wal_private_with_all_indexes_and_ledger() {
     let path = home.join("archive.sqlite3");
     let conn = archive::connect(Some(&path)).unwrap();
     assert_eq!(user_version(&conn), archive::SCHEMA_VERSION);
-    assert_eq!(archive::SCHEMA_VERSION, 8);
+    assert_eq!(archive::SCHEMA_VERSION, 9);
     assert!(migrations::pending(&conn).unwrap().is_empty());
     let hist = migrations::history(&conn).unwrap();
     let versions: Vec<i64> = hist.iter().map(|m| m.version).collect();
     assert_eq!(versions, (1..=archive::SCHEMA_VERSION).collect::<Vec<_>>());
     let jm: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
     assert_eq!(jm.to_lowercase(), "wal");
-    assert!(all_new_indexes().is_subset(&indexes(&conn)));
+    let idxs = indexes(&conn);
+    assert!(all_new_indexes().is_subset(&idxs));
+    assert!(!idxs.contains("messages_by_sender"));
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     let plan: Vec<String> = conn
         .prepare("EXPLAIN QUERY PLAN SELECT * FROM messages WHERE message_id = ?")
@@ -456,4 +458,86 @@ fn verify_detects_missing_schema_migrations_entries() {
             .any(|e| e.as_str().unwrap_or("").contains("v5")),
         "{res}"
     );
+}
+
+#[test]
+fn v8_to_v9_clears_raw_drops_sender_index_and_compacts_ephemeral_records() {
+    let (_g, _td, home) = fresh_home();
+    let path = home.join("archive.sqlite3");
+    {
+        let c = Connection::open(&path).unwrap();
+        archive::create_schema_at(&c, 8).unwrap();
+        assert!(indexes(&c).contains("messages_by_sender"));
+        c.execute(
+            "INSERT INTO people (mri, name, raw, first_seen_at, last_seen_at) VALUES (?, 'Ada', '{\"mri\":\"ada\"}', 1, 1)",
+            [ADA],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO conversations (id, kind, name, raw, first_seen_at, last_seen_at) VALUES (?, 'chat', 'Launch', '{\"id\":\"g\"}', 1, 1)",
+            [GROUP],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages (conversation_id, message_id, kind, text, raw, first_seen_at, last_seen_at) \
+             VALUES (?, 'm1', 'message', 'hello', '{\"id\":\"m1\"}', 1, 1)",
+            [GROUP],
+        )
+        .unwrap();
+        let insert_rv = |src: &str, key: &str, hash: &str, val: serde_json::Value, cap: i64| {
+            c.execute(
+                "INSERT INTO record_versions (source, record_key, hash, data, captured_at) VALUES (?, ?, ?, ?, ?)",
+                params![src, key, hash, archive::encode_record(&val), cap],
+            )
+            .unwrap();
+        };
+        insert_rv("streams-replychain-manager/drafts", "d1", "h1", json!({"v": 1}), 10);
+        insert_rv("streams-replychain-manager/drafts", "d1", "h2", json!({"v": 2}), 20);
+        insert_rv(
+            "consumption-horizon-manager/consumption-horizon-history",
+            GROUP,
+            "h1",
+            json!({"v": 1}),
+            10,
+        );
+        insert_rv(
+            "consumption-horizon-manager/consumption-horizon-history",
+            GROUP,
+            "h2",
+            json!({"v": 2}),
+            20,
+        );
+        insert_rv("message", &format!("{GROUP}/m1"), "h1", json!({"v": 1}), 10);
+        insert_rv("message", &format!("{GROUP}/m1"), "h2", json!({"v": 2}), 20);
+    }
+
+    let conn = archive::connect(Some(&path)).unwrap();
+    assert_eq!(user_version(&conn), 9);
+    assert!(!indexes(&conn).contains("messages_by_sender"));
+    for tbl in ["messages", "conversations", "people"] {
+        let non_null: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {tbl} WHERE raw IS NOT NULL"), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(non_null, 0, "{tbl}.raw must be NULL after v9");
+    }
+    let count_src = |src: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM record_versions WHERE source = ?", [src], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count_src("streams-replychain-manager/drafts"), 1);
+    assert_eq!(count_src("consumption-horizon-manager/consumption-horizon-history"), 1);
+    assert_eq!(count_src("message"), 2);
+    let latest_draft: serde_json::Value = conn
+        .query_row(
+            "SELECT data FROM record_versions WHERE source = 'streams-replychain-manager/drafts'",
+            [],
+            |r| Ok(archive::decode_record_ref(r.get_ref(0)?).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(latest_draft, json!({"v": 2}));
+    assert_eq!(backups::verify_archive(Some(&conn), None, true)["ok"], true);
 }

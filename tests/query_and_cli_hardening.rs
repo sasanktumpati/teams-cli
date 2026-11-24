@@ -710,7 +710,7 @@ fn reindex_waits_for_the_sync_lock() {
     let (_td, h) = home_with_archive();
     std::env::set_var("TEAMS_CLI_HOME", &h);
     let lock = teams_cli::ingest::sync::acquire_sync_lock(1.0).unwrap();
-    let mut child = teams_cmd(&h, &["reindex"])
+    let mut child = teams_cmd(&h, &["archive", "reindex"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -733,9 +733,18 @@ fn restore_yes_restores_an_xz_backup_and_rejects_bad_ones() {
         home_with_archive()
     };
     let dest = td.path().join("snap.sqlite3.xz");
-    let o = teams(&h, &["backup", "--out", dest.to_str().unwrap()]);
+    let o = teams(&h, &["archive", "backup", "--out", dest.to_str().unwrap()]);
     assert_eq!(o.code, 0, "{}", o.err);
-    let o = teams(&h, &["restore", dest.to_str().unwrap(), "--yes", "--no-safety-backup"]);
+    let o = teams(
+        &h,
+        &[
+            "archive",
+            "restore",
+            dest.to_str().unwrap(),
+            "--yes",
+            "--no-safety-backup",
+        ],
+    );
     assert_eq!(o.code, 0, "{} / {}", o.out, o.err);
     assert!(o.out.contains("Restored"), "{}", o.out);
     let o = teams(&h, &["chats"]);
@@ -743,19 +752,19 @@ fn restore_yes_restores_an_xz_backup_and_rejects_bad_ones() {
     assert!(o.out.contains("Launch crew"));
 
     let missing = td.path().join("nope.sqlite3.xz");
-    let o = teams(&h, &["restore", missing.to_str().unwrap(), "--yes"]);
+    let o = teams(&h, &["archive", "restore", missing.to_str().unwrap(), "--yes"]);
     assert_eq!(o.code, 1);
     assert!(o.err.contains("failed verification"), "{}", o.err);
 
     let wrong = td.path().join("notes.txt");
     std::fs::write(&wrong, b"hello").unwrap();
-    let o = teams(&h, &["restore", wrong.to_str().unwrap(), "--yes"]);
+    let o = teams(&h, &["archive", "restore", wrong.to_str().unwrap(), "--yes"]);
     assert_eq!(o.code, 1);
     assert!(o.err.contains("failed verification"), "{}", o.err);
 
     let bad = td.path().join("bad.sqlite3.xz");
     std::fs::write(&bad, b"garbage".repeat(50)).unwrap();
-    let o = teams(&h, &["restore", bad.to_str().unwrap(), "--yes"]);
+    let o = teams(&h, &["archive", "restore", bad.to_str().unwrap(), "--yes"]);
     assert_eq!(o.code, 1);
     assert!(o.err.contains("failed verification"), "{}", o.err);
     assert_eq!(teams(&h, &["chats"]).code, 0);

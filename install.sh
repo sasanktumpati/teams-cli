@@ -125,7 +125,7 @@ fi
 PLIST="$HOME/Library/LaunchAgents/dev.teams-cli.daemon.plist"
 if [ -f "$PLIST" ] && grep -Fq "<string>$INSTALL_DIR/teams</string>" "$PLIST" 2>/dev/null; then
   if launchctl print "gui/$(id -u)/dev.teams-cli.daemon" >/dev/null 2>&1; then
-    if "$INSTALL_DIR/teams" agent restart >/dev/null 2>&1; then
+    if "$INSTALL_DIR/teams" daemon restart >/dev/null 2>&1; then
       ok_step "daemon" "restarted"
     fi
   fi
@@ -152,6 +152,6 @@ fi
 if [ -z "$PREV_VERSION" ]; then
   printf "\n${BOLD}Next${RESET}\n"
   printf "  teams sync\n"
-  printf "  teams agent install\n"
+  printf "  teams daemon install\n"
   printf "  teams doctor\n"
 fi

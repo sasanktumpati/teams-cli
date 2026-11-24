@@ -954,7 +954,7 @@ pub fn extract_into_with_seed<S: ExtractSink>(
     if !seed.incremental && (!has_replychain_db || unique_msgs.is_empty()) {
         return Err(ExtractError::Source(SourceError(
             "No messages found in the Teams cache. Teams may have changed its storage format; \
-             run `teams raw stores` to inspect it."
+             run `teams debug stores` to inspect it."
                 .to_string(),
         )));
     }

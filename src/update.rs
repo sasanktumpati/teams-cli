@@ -376,10 +376,21 @@ pub fn run_update(opts: &UpdateOptions) -> Result<UpdateOutcome, String> {
         cache.tag = Some(outcome.tag.clone());
         let _ = save_update_cache(&cache_path, &cache);
     }
-    if outcome.updated && launchd::status()["loaded"].as_bool().unwrap_or(false) {
-        match launchd::restart() {
-            Ok(_) => outcome.daemon_restarted = true,
-            Err(e) => outcome.daemon_restart_error = Some(e),
+    if outcome.updated {
+        let agent = launchd::status();
+        if agent["loaded"].as_bool().unwrap_or(false) {
+            if agent["executableMatches"].as_bool() == Some(false) {
+                outcome.daemon_restart_error = Some(format!(
+                    "LaunchAgent plist points to {} instead of {}; run `teams daemon install`",
+                    agent["plistExecutable"].as_str().unwrap_or("another binary"),
+                    exe.display()
+                ));
+            } else {
+                match launchd::restart() {
+                    Ok(_) => outcome.daemon_restarted = true,
+                    Err(e) => outcome.daemon_restart_error = Some(e),
+                }
+            }
         }
     }
     Ok(outcome)

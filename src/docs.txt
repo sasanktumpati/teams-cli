@@ -8,7 +8,7 @@ Conventions
   Search: prefix words, "exact phrase", OR, NOT, -exclude / -"phrase"; --relevance weights subject > body.
   Exit codes: 0 ok, 1 runtime/archive/health error, 2 bad input. Errors go to stderr.
   HTTP API (127.0.0.1:{port}, loopback Host only, no Origin):
-    GET /health (open); all /v1/* require `Authorization: Bearer <token>` (`teams token` or `teams token create`).
+    GET /health (open); all /v1/* require `Authorization: Bearer <token>` (`teams token create <name>`).
     GET /v1/<cmd> (camelCase flags): status, chats(query member kind), messages(chat|around context sender thread includeHistory),
     search(query includeHistory countOnly hasAttachments sender chat sort=relevance), attachments, people, person(person),
     changes(what=edited|deleted), records(source key allVersions), inbox, mentions(chat unreadOnly), calls(person missedOnly),
@@ -39,34 +39,30 @@ JSON shapes
   migrations  {currentVersion, targetVersion, applied: [{version, name, appliedAt, appVersion, durationMs}], pending}
 
 Commands
-  teams sync [--source DIR] [--force] [--json]
-  teams status [--json]
-  teams doctor [--json]
-  teams migrations [--json]
+  teams inbox [--since T=7d] [--limit N=30] [--json]
   teams chats [--grep Q] [--kind chat|channel|meeting|team|community|system] [--all] [--member PERSON] [--limit N=40] [--json]
   teams messages [chat] [--around MSG_ID] [--context N=10] [--thread ID] [--history] [--since T] [--until T] [--from PERSON] [--limit N=100] [--events] [--json]
-  teams changes [--since T=7d] [--until T] [--chat CHAT] [--edited] [--deleted] [--limit N=50] [--json]
-  teams records [source] [--key KEY] [--since T] [--all-versions] [--limit N=50] [--json]
   teams search [query...] [--chat CHAT] [--relevance] [--include-history] [--count] [--has-attachments] [--since T] [--until T] [--from PERSON] [--limit N=30] [--events] [--json]
-  teams attachments [query...] [--chat CHAT] [--kind file|image|link] [--type EXT] [--since T] [--until T] [--from PERSON] [--limit N=50] [--json]
-  teams fetch [target...] [--message MSG_ID] [--index N] [--out PATH] [--force-download] [--max-bytes BYTES] [--json]
-  teams send target [message...] [--stdin] [--reply-to MSG_ID] [--html] [--client-message-id ID] [--dry-run] [--yes] [--json]
-  teams people [--grep Q] [--bots] [--limit N=50] [--json]
-  teams person person... [--limit N=20] [--json]
-  teams inbox [--since T=7d] [--limit N=30] [--json]
   teams mentions [--since T] [--until T] [--chat CHAT] [--unread] [--limit N=50] [--json]
+  teams changes [--since T=7d] [--until T] [--chat CHAT] [--edited] [--deleted] [--limit N=50] [--json]
+  teams attachments [query...] [--chat CHAT] [--kind file|image|link] [--type EXT] [--since T] [--until T] [--from PERSON] [--limit N=50] [--json]
+  teams people [person...] [--grep Q] [--bots] [--limit N] [--json]
   teams calls [--since T] [--until T] [--with PERSON] [--missed] [--limit N=50] [--json]
   teams meetings [--since T] [--until T] [--grep Q] [--limit N=50] [--json]
   teams saved [--all] [--limit N=50] [--json]
   teams pinned [--chat CHAT] [--limit N=50] [--json]
   teams export chat [--since T] [--until T] [--from PERSON] [--thread ID] [--events] [--history] [--out PATH]
-  teams verify [file] [--no-backups] [--json]
-  teams restore backup [--yes] [--no-safety-backup] [--json]
-  teams backup [--out PATH]
-  teams reindex
-  teams daemon [--port PORT] [--interval SEC=60] [--no-sync] [--log-stderr]
-  teams token [--rotate] [--json] | create NAME [--expires T] | list [--include-expired] | revoke TARGET | prune
-  teams agent install [--interval SEC=60] [--port PORT] | uninstall | restart | status | logs [--lines N=50]
-  teams raw stores | dump DB STORE
-  teams completions bash|zsh|fish|elvish|powershell
+  teams fetch [target...] [--message MSG_ID] [--index N] [--out PATH] [--force-download] [--max-bytes BYTES] [--json]
+  teams send target [message...] [--stdin] [--reply-to MSG_ID] [--html] [--client-message-id ID] [--dry-run] [--yes] [--json]
+  teams sync [--source DIR] [--force] [--json]
+  teams status [--json]
+  teams doctor [--json]
+  teams daemon install [--interval SEC=60] [--port PORT] | uninstall | restart | status | logs [--lines N=50] [--follow] | run [--port PORT] [--interval SEC=60] [--no-sync] [--log-stderr]
+  teams archive backup [--out PATH] | restore BACKUP [--yes] [--no-safety-backup] [--json] | verify [FILE] [--no-backups] [--json] | reindex | migrations [--json]
+  teams token create NAME [--expires T] [--json] | list [--include-expired] [--json] | revoke TARGET [--json] | prune [--json]
   teams update [--check] [--version TAG] [--force] [--json]
+  teams debug records [SOURCE] [--key KEY] [--since T] [--all-versions] [--limit N=50] [--json] | stores | dump DB STORE
+  teams completions bash|zsh|fish|elvish|powershell
+
+Env
+  TEAMS_CLI_HOME, TEAMS_CLI_SOURCE, TEAMS_CLI_PORT, TEAMS_CLI_FULL_SYNC=1, TEAMS_CLI_NO_UPDATE_CHECK=1, TEAMS_CLI_ENABLE_SEND=1, TEAMS_CLI_SEND_ALLOWLIST

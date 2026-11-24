@@ -4,16 +4,14 @@ use crate::timeutil;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const API_TOKEN_ENV: &str = "TEAMS_CLI_API_TOKEN";
 pub(crate) const UNAUTHORIZED_MESSAGE: &str =
-    "Missing or invalid bearer token. Run `teams token` on this Mac to print it.";
+    "Missing or invalid bearer token. Create one with `teams token create <name>` on this Mac.";
 
 const MAX_NAMED_TOKEN_NAME: usize = 64;
 const NAMED_TOKEN_PREFIX: &str = "tc_";
@@ -64,13 +62,6 @@ pub fn is_allowed_headers(hosts: &[&str], origins: &[&str], sec_fetch_sites: &[&
     is_allowed(Some(host), None, None)
 }
 
-pub fn env_api_token() -> Option<String> {
-    env::var(API_TOKEN_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn random_hex(bytes: usize) -> Result<String, String> {
     let mut buf = vec![0u8; bytes];
     getrandom::getrandom(&mut buf).map_err(|e| format!("OS random number generator failed: {e}"))?;
@@ -92,10 +83,18 @@ fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-type FileHandleSig = (PathBuf, u64, u64, i64, i64, u64);
+type FileHandleSig = (PathBuf, u64, u64, i64, i64, u64, u32);
 
 fn sig_from_meta(path: &Path, m: &fs::Metadata) -> FileHandleSig {
-    (path.to_path_buf(), m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.len())
+    (
+        path.to_path_buf(),
+        m.dev(),
+        m.ino(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.len(),
+        m.mode(),
+    )
 }
 
 fn path_sig(path: &Path) -> Option<FileHandleSig> {
@@ -109,86 +108,19 @@ fn read_private_file_with_sig(path: &Path) -> Result<Option<(FileHandleSig, Stri
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("failed reading {}: {e}", path.display())),
     };
-    let meta = f
+    let mut meta = f
         .metadata()
         .map_err(|e| format!("failed stating {}: {e}", path.display()))?;
-    if meta.permissions().mode() & 0o777 != 0o600 {
-        let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+    if meta.permissions().mode() & 0o777 != 0o600 && f.set_permissions(fs::Permissions::from_mode(0o600)).is_ok() {
+        if let Ok(updated) = f.metadata() {
+            meta = updated;
+        }
     }
     let sig = sig_from_meta(path, &meta);
     let mut content = String::new();
     f.read_to_string(&mut content)
         .map_err(|e| format!("failed reading {}: {e}", path.display()))?;
     Ok(Some((sig, content)))
-}
-
-fn read_api_token_file(path: &Path) -> Result<Option<String>, String> {
-    match read_private_file_with_sig(path)? {
-        Some((_, s)) => {
-            let t = s.trim();
-            Ok((!t.is_empty()).then(|| t.to_string()))
-        }
-        None => Ok(None),
-    }
-}
-
-fn create_api_token_file(path: &Path, token: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut rnd = [0u8; 6];
-    getrandom::getrandom(&mut rnd).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let tmp = parent.join(format!(".api.token.{}.{}.tmp", std::process::id(), hex::encode(rnd)));
-    let res = (|| {
-        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        f.write_all(format!("{token}\n").as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        fs::hard_link(&tmp, path)?;
-        paths::fsync_dir(parent);
-        Ok(())
-    })();
-    let _ = fs::remove_file(&tmp);
-    res
-}
-
-pub fn peek_api_token() -> Result<Option<String>, String> {
-    if let Some(t) = env_api_token() {
-        return Ok(Some(t));
-    }
-    read_api_token_file(&paths::api_token_path())
-}
-
-pub fn load_or_create_api_token() -> Result<String, String> {
-    if let Some(t) = env_api_token() {
-        return Ok(t);
-    }
-    let path = paths::api_token_path();
-    for _ in 0..5 {
-        if let Some(t) = read_api_token_file(&path)? {
-            return Ok(t);
-        }
-        let token = generate_api_token()?;
-        if path.exists() {
-            paths::atomic_write_text(&path, &format!("{token}\n"))
-                .map_err(|e| format!("failed writing {}: {e}", path.display()))?;
-            return Ok(token);
-        }
-        match create_api_token_file(&path, &token) {
-            Ok(()) => return Ok(token),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("failed writing {}: {e}", path.display())),
-        }
-    }
-    Err(format!("failed creating {}: it keeps changing", path.display()))
-}
-
-pub fn rotate_api_token() -> Result<String, String> {
-    let path = paths::api_token_path();
-    let token = generate_api_token()?;
-    paths::atomic_write_text(&path, &format!("{token}\n"))
-        .map_err(|e| format!("failed writing {}: {e}", path.display()))?;
-    Ok(token)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,10 +350,8 @@ pub fn prune_expired_tokens() -> Result<Value, String> {
 }
 
 type NamedDigest = ([u8; 32], Option<i64>);
-type TokenSnapshot = ([u8; 32], Vec<NamedDigest>);
 
 struct CachedTokens {
-    primary: Option<(FileHandleSig, [u8; 32])>,
     named_sig: Option<FileHandleSig>,
     named: Vec<NamedDigest>,
 }
@@ -434,7 +364,6 @@ impl Default for ApiToken {
     fn default() -> Self {
         Self {
             cached: Mutex::new(CachedTokens {
-                primary: None,
                 named_sig: None,
                 named: Vec::new(),
             }),
@@ -444,77 +373,39 @@ impl Default for ApiToken {
 
 impl ApiToken {
     pub(crate) fn ensure_ready(&self) -> Result<(), String> {
-        if env_api_token().is_some() {
-            return Ok(());
-        }
-        let _ = load_or_create_api_token()?;
         let _ = self.refresh_if_needed()?;
         Ok(())
     }
 
-    fn refresh_if_needed(&self) -> Result<TokenSnapshot, String> {
-        let primary_path = paths::api_token_path();
+    fn refresh_if_needed(&self) -> Result<Vec<NamedDigest>, String> {
         let named_path = paths::api_tokens_path();
         let mut cache = self.cached.lock().unwrap_or_else(|p| p.into_inner());
 
-        let cur_psig = path_sig(&primary_path);
-        let primary_digest = match (&cur_psig, &cache.primary) {
-            (Some(s), Some((cs, digest))) if s == cs => *digest,
-            _ => match read_private_file_with_sig(&primary_path)? {
-                Some((sig, content)) if !content.trim().is_empty() => {
-                    let digest = sha256_bytes(content.trim());
-                    cache.primary = Some((sig, digest));
-                    digest
-                }
-                _ => {
-                    let tok = load_or_create_api_token()?;
-                    let digest = sha256_bytes(&tok);
-                    if let Some((sig, _)) = read_private_file_with_sig(&primary_path)? {
-                        cache.primary = Some((sig, digest));
-                    } else {
-                        cache.primary = None;
-                    }
-                    digest
-                }
-            },
-        };
-
         let cur_nsig = path_sig(&named_path);
         if cur_nsig != cache.named_sig {
-            match read_named_store(&named_path) {
-                Ok((sig, list)) => {
-                    let mut digests = Vec::with_capacity(list.len());
-                    for t in list {
-                        if let Ok(raw) = hex::decode(&t.sha256) {
-                            if raw.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&raw);
-                                digests.push((arr, t.expires_at_ms));
-                            }
-                        }
+            let (sig, list) = read_named_store(&named_path)?;
+            let mut digests = Vec::with_capacity(list.len());
+            for t in list {
+                if let Ok(raw) = hex::decode(&t.sha256) {
+                    if raw.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&raw);
+                        digests.push((arr, t.expires_at_ms));
                     }
-                    cache.named_sig = sig;
-                    cache.named = digests;
-                }
-                Err(_) => {
-                    cache.named_sig = cur_nsig;
-                    cache.named.clear();
                 }
             }
+            cache.named_sig = sig;
+            cache.named = digests;
         }
 
-        Ok((primary_digest, cache.named.clone()))
+        Ok(cache.named.clone())
     }
 
     pub(crate) fn verify(&self, candidate: &str) -> Result<bool, String> {
         let given = sha256_bytes(candidate);
-        if let Some(env_tok) = env_api_token() {
-            let expected = sha256_bytes(&env_tok);
-            return Ok(ct_eq_32(&given, &expected));
-        }
-        let (primary_digest, named) = self.refresh_if_needed()?;
+        let named = self.refresh_if_needed()?;
         let now_ms = timeutil::now_ms();
-        let mut matched = ct_eq_32(&given, &primary_digest);
+        let mut matched = false;
         for (digest, expires_at_ms) in &named {
             let active = !expires_at_ms.is_some_and(|exp| exp <= now_ms);
             let eq = ct_eq_32(&given, digest);

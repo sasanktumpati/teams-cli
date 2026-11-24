@@ -367,11 +367,16 @@ fn update_notice_modes_respect_json_and_machine_commands() {
     assert_eq!(mode(&["teams", "sync", "--notify"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "sync", "--json"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "update", "--check"]), UpdateNoticeMode::None);
-    assert_eq!(mode(&["teams", "daemon"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "daemon", "run"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "daemon", "status"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "daemon", "logs"]), UpdateNoticeMode::Full);
+    assert_eq!(mode(&["teams", "daemon", "logs", "--follow"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "archive", "backup"]), UpdateNoticeMode::Full);
+    assert_eq!(mode(&["teams", "archive", "verify", "--json"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "debug", "stores"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "docs"]), UpdateNoticeMode::None);
-    assert_eq!(mode(&["teams", "token"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "token", "list"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "token", "create", "ci"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "completions", "zsh"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "export", "General"]), UpdateNoticeMode::None);
-    assert_eq!(mode(&["teams", "agent", "status"]), UpdateNoticeMode::None);
-    assert_eq!(mode(&["teams", "agent", "logs"]), UpdateNoticeMode::Full);
 }

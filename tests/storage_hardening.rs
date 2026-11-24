@@ -584,3 +584,143 @@ fn atomic_writes_leave_no_temp_files_and_apply_mode() {
     assert!(paths::atomic_copy_file(&d.path().join("missing"), &b, 0o600, ".copy-").is_err());
     assert_eq!(fs::read_dir(d.path()).unwrap().count(), 2);
 }
+
+#[test]
+fn backups_to_keep_caps_migration_backups_and_preserves_restore_safety_copies() {
+    let names: Vec<String> = vec![
+        "archive-before-v2-20261123-154917.sqlite3.xz",
+        "archive-before-v3-20261124-014159.sqlite3.xz",
+        "archive-before-v4-20261124-020848.sqlite3.xz",
+        "archive-before-v7-20261124-053500.sqlite3.xz",
+        "archive-before-v8-20261124-084942.sqlite3.xz",
+        "archive-before-restore-20261124-090000.sqlite3.xz",
+        "archive-20261124-161754.sqlite3.xz",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let keep = backups::backups_to_keep(&names, 7, 4, 6);
+    assert!(keep.contains("archive-before-v8-20261124-084942.sqlite3.xz"));
+    assert!(keep.contains("archive-before-v7-20261124-053500.sqlite3.xz"));
+    assert!(!keep.contains("archive-before-v4-20261124-020848.sqlite3.xz"));
+    assert!(!keep.contains("archive-before-v3-20261124-014159.sqlite3.xz"));
+    assert!(!keep.contains("archive-before-v2-20261123-154917.sqlite3.xz"));
+    assert!(keep.contains("archive-before-restore-20261124-090000.sqlite3.xz"));
+    assert!(keep.contains("archive-20261124-161754.sqlite3.xz"));
+}
+
+#[test]
+fn ephemeral_record_sources_keep_only_latest_version() {
+    let (_td, conn) = fresh_archive();
+    let rec = |source: &str, key: &str, v: i64| teams_cli::ingest::extract::RawRecord {
+        source: source.to_string(),
+        key: key.to_string(),
+        data: json!({"v": v}),
+    };
+    archive::apply_snapshot(
+        &conn,
+        &snapshot(
+            vec![],
+            vec![],
+            vec![
+                rec("streams-replychain-manager/drafts", "d1", 1),
+                rec("consumption-horizon-manager/consumption-horizon-history", GROUP, 1),
+                rec("message", &format!("{GROUP}/m1"), 1),
+            ],
+        ),
+        Some(10),
+    )
+    .unwrap();
+    archive::apply_snapshot(
+        &conn,
+        &snapshot(
+            vec![],
+            vec![],
+            vec![
+                rec("streams-replychain-manager/drafts", "d1", 2),
+                rec("consumption-horizon-manager/consumption-horizon-history", GROUP, 2),
+                rec("message", &format!("{GROUP}/m1"), 2),
+            ],
+        ),
+        Some(20),
+    )
+    .unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM record_versions WHERE source = 'streams-replychain-manager/drafts'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM record_versions WHERE source = 'consumption-horizon-manager/consumption-horizon-history'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM record_versions WHERE source = 'message'"),
+        2
+    );
+}
+
+#[test]
+fn prune_old_sync_runs_keeps_recent_and_errors() {
+    let (_td, conn) = fresh_archive();
+    let now = archive::now_ms();
+    let old_ts = now - 120 * 86_400_000;
+    for i in 0..5 {
+        conn.execute(
+            "INSERT INTO sync_runs (started_at, finished_at, status) VALUES (?, ?, 'ok')",
+            rusqlite::params![old_ts + i, old_ts + i],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, finished_at, status, message) VALUES (?, ?, 'error', 'boom')",
+        rusqlite::params![old_ts, old_ts],
+    )
+    .unwrap();
+    for i in 0..3 {
+        conn.execute(
+            "INSERT INTO sync_runs (started_at, finished_at, status) VALUES (?, ?, 'ok')",
+            rusqlite::params![now - 1000 + i, now - 1000 + i],
+        )
+        .unwrap();
+    }
+    let removed = archive::prune_old_sync_runs(&conn, 90, 3).unwrap();
+    assert_eq!(removed, 5);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_runs WHERE status = 'error'"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_runs WHERE status = 'ok'"), 3);
+}
+
+#[test]
+fn status_does_not_treat_migration_backup_as_scheduled_backup() {
+    let _g = env_lock();
+    let td = tempfile::tempdir().unwrap();
+    std::env::set_var("TEAMS_CLI_HOME", td.path());
+    let conn = archive::connect(Some(&td.path().join("archive.sqlite3"))).unwrap();
+    let now = archive::now_ms();
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, finished_at, status) VALUES (?, ?, 'ok')",
+        rusqlite::params![now, now],
+    )
+    .unwrap();
+    fs::write(
+        paths::backups_dir().join("archive-before-v9-20261124-120000.sqlite3.xz"),
+        b"migration-only",
+    )
+    .unwrap();
+    let st = teams_cli::query::api::status(&conn).unwrap();
+    let problems: Vec<&str> = st["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        problems.iter().any(|p| p.contains("No recent backup")),
+        "migration snapshot must not satisfy scheduled backup check: {problems:?}"
+    );
+}

@@ -168,7 +168,7 @@ pub fn run_diagnostics() -> Value {
             Err(e) => CheckResult::fail(
                 "archive",
                 format!("failed opening {}: {e}", ap.display()),
-                "Run `teams verify` to inspect archive integrity.",
+                "Run `teams archive verify` to inspect archive integrity.",
             ),
         }
     });
@@ -200,7 +200,7 @@ pub fn run_diagnostics() -> Value {
             (_, Some(ref l)) if l.status == "error" => CheckResult::fail(
                 "sync",
                 format!("last sync failed: {}", l.message.as_deref().unwrap_or("unknown error")),
-                "Run `teams sync` to inspect the error or check `teams agent logs`.",
+                "Run `teams sync` to inspect the error or check `teams daemon logs`.",
             ),
             (Some(ok), _) => {
                 let age_mins = ok
@@ -212,26 +212,57 @@ pub fn run_diagnostics() -> Value {
         });
 
         let bks = backups::list_backups(None);
+        let scheduled_bks: Vec<&std::path::PathBuf> = bks
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(backups::is_scheduled_backup)
+            })
+            .collect();
         let bk_err = archive::get_meta(conn, "backup_error").filter(|s| !s.is_empty());
         checks.push(if let Some(err) = bk_err {
             CheckResult::fail(
                 "backups",
                 format!("last backup failed: {err}"),
-                "Run `teams backup` to retry.",
+                "Run `teams archive backup` to retry.",
             )
-        } else if let Some(latest) = bks.last() {
+        } else if let Some(latest) = scheduled_bks.last() {
             let age_h = latest
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok()?.duration_since(UNIX_EPOCH).ok())
                 .map(|d| (archive::now_ms() / 1000 - d.as_secs() as i64).max(0) / 3600)
                 .unwrap_or(0);
-            CheckResult::pass("backups", format!("{} backup(s), latest {age_h}h ago", bks.len()))
+            if age_h >= 48 {
+                CheckResult::fail(
+                    "backups",
+                    format!(
+                        "{} scheduled backup(s) ({} total), latest is {age_h}h old",
+                        scheduled_bks.len(),
+                        bks.len()
+                    ),
+                    "Run `teams archive backup` to create a fresh verified backup.",
+                )
+            } else {
+                CheckResult::pass(
+                    "backups",
+                    format!(
+                        "{} scheduled backup(s) ({} total), latest {age_h}h ago",
+                        scheduled_bks.len(),
+                        bks.len()
+                    ),
+                )
+            }
         } else {
             CheckResult::fail(
                 "backups",
-                "no backups found",
-                "Run `teams backup` to create an initial verified backup.",
+                if bks.is_empty() {
+                    "no backups found".to_string()
+                } else {
+                    format!("no scheduled backups ({} safety backup(s) only)", bks.len())
+                },
+                "Run `teams archive backup` to create an initial verified backup.",
             )
         });
     }
@@ -243,7 +274,7 @@ pub fn run_diagnostics() -> Value {
         CheckResult::fail(
             "daemon_agent",
             "launchd agent is not loaded",
-            "Run `teams agent install` to start the background sync and local API.",
+            "Run `teams daemon install` to start the background sync and local API.",
         )
     } else if exe_match == Some(false) {
         CheckResult::fail(
@@ -253,7 +284,7 @@ pub fn run_diagnostics() -> Value {
                 agent["pid"].as_str().unwrap_or("?"),
                 agent["plistExecutable"].as_str().unwrap_or("?")
             ),
-            "Run `teams agent install` to update the LaunchAgent to the current binary.",
+            "Run `teams daemon install` to update the LaunchAgent to the current binary.",
         )
     } else {
         CheckResult::pass(
@@ -275,45 +306,37 @@ pub fn run_diagnostics() -> Value {
                     format!(
                         "127.0.0.1:{port} is not verified as the teams-cli LaunchAgent (refusing to send bearer token)"
                     ),
-                    "Run `teams agent install` or check what process owns the port (`lsof -iTCP:47613 -sTCP:LISTEN`).",
+                    "Run `teams daemon install` or check what process owns the port (`lsof -iTCP:47613 -sTCP:LISTEN`).",
                 )
             } else {
-                match daemon::peek_api_token() {
-                    Ok(Some(tok)) => match probe_http(port, "/v1/status", Some(&tok)) {
-                        Ok((200, _)) => {
-                            let named_n = daemon::list_named_tokens(false)
-                                .ok()
-                                .and_then(|v| v["count"].as_u64())
-                                .unwrap_or(0);
+                match probe_http(port, "/v1/status", None) {
+                    Ok((401, _)) => match daemon::list_named_tokens(false) {
+                        Ok(v) => {
+                            let named_n = v["count"].as_u64().unwrap_or(0);
+                            let note = if named_n == 0 {
+                                "0 active tokens; run `teams token create <name>` to grant API access".to_string()
+                            } else {
+                                format!("{named_n} active named token(s)")
+                            };
                             CheckResult::pass(
                                 "local_api",
-                                format!(
-                                    "http://127.0.0.1:{port} healthy and bearer auth ok ({named_n} active named token(s))"
-                                ),
+                                format!("http://127.0.0.1:{port} healthy and bearer auth enforced ({note})"),
                             )
                         }
-                        Ok((409, _)) => CheckResult::fail(
+                        Err(e) => CheckResult::fail(
                             "local_api",
-                            format!("http://127.0.0.1:{port} reachable and authenticated, but archive is empty"),
-                            "Run `teams sync` to populate the archive.",
+                            format!("API token store error: {e}"),
+                            "Check permissions or JSON validity of api.tokens.json.",
                         ),
-                        Ok((code, _)) => CheckResult::fail(
-                            "local_api",
-                            format!("http://127.0.0.1:{port}/v1/status returned HTTP {code}"),
-                            "Check `TEAMS_CLI_API_TOKEN` or run `teams agent restart`.",
-                        ),
-                        Err(e) => CheckResult::fail("local_api", e, "Check `teams agent logs`."),
                     },
-                    Ok(None) => CheckResult::fail(
+                    Ok((code, _)) => CheckResult::fail(
                         "local_api",
-                        format!("http://127.0.0.1:{port}/health ok, but no API token file exists yet"),
-                        "Run `teams token` to initialize api.token.",
+                        format!(
+                            "http://127.0.0.1:{port}/v1/status returned HTTP {code} without a bearer token (expected 401)"
+                        ),
+                        "Run `teams daemon restart` and check `teams daemon logs`.",
                     ),
-                    Err(e) => CheckResult::fail(
-                        "local_api",
-                        format!("API token error: {e}"),
-                        "Check permissions on api.token.",
-                    ),
+                    Err(e) => CheckResult::fail("local_api", e, "Check `teams daemon logs`."),
                 }
             }
         }
@@ -325,7 +348,7 @@ pub fn run_diagnostics() -> Value {
         Err(e) => CheckResult::fail(
             "local_api",
             e,
-            "Run `teams agent install` (or `teams daemon` in a terminal).",
+            "Run `teams daemon install` (or `teams daemon run` in a terminal).",
         ),
     };
     checks.push(api_check);

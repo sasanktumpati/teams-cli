@@ -636,6 +636,36 @@ impl TeamsCache {
             .collect()
     }
 
+    pub fn watched_metadata_snapshot(
+        &self,
+        direct: &[(&str, &str)],
+        keyed: &[(&str, &str)],
+    ) -> (BTreeMap<String, u64>, BTreeMap<u64, BTreeMap<String, u64>>) {
+        let wanted = wanted_store_pairs(&self.db_ids, &self.store_ids, direct, keyed);
+        let wanted_dbs: HashSet<u64> = wanted.iter().map(|&(db_id, _)| db_id).collect();
+        let db_ids = self
+            .db_ids
+            .iter()
+            .filter(|(_, &id)| wanted_dbs.contains(&id))
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        let mut store_ids: BTreeMap<u64, BTreeMap<String, u64>> = BTreeMap::new();
+        for (&db_id, stores) in &self.store_ids {
+            if !wanted_dbs.contains(&db_id) {
+                continue;
+            }
+            let kept: BTreeMap<String, u64> = stores
+                .iter()
+                .filter(|(_, &sid)| wanted.contains(&(db_id, sid)))
+                .map(|(k, &v)| (k.clone(), v))
+                .collect();
+            if !kept.is_empty() {
+                store_ids.insert(db_id, kept);
+            }
+        }
+        (db_ids, store_ids)
+    }
+
     pub fn database_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.db_ids.keys().cloned().collect();
         names.sort();

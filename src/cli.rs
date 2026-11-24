@@ -32,35 +32,22 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    #[command(about = "Everything on one page: commands, flags, JSON shapes (for agents and scripts)")]
-    Docs,
-
-    #[command(about = "Copy new messages from the Teams cache into the archive")]
-    Sync {
-        #[arg(long, help = "Override the Teams IndexedDB directory path")]
-        source: Option<String>,
-        #[arg(long, help = "Re-read the Teams cache even if its file fingerprint is unchanged")]
-        force: bool,
-        #[arg(long, hide = true)]
-        notify: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Archive health, counts and last sync")]
-    Status {
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Diagnose local setup: Teams cache permissions, archive, daemon, API auth, and backups")]
-    Doctor {
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Show archive schema version, applied migration ledger, and any pending upgrades")]
-    Migrations {
+    #[command(about = "What needs attention: unread chats, mentions, awaiting your reply, unread activity")]
+    Inbox {
+        #[arg(
+            long,
+            default_value = "7d",
+            help = "Activity at or after this time (\"all\" for entire archive)"
+        )]
+        since: String,
+        #[arg(
+            long,
+            default_value_t = 30,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum items per section (0 = all)"
+        )]
+        limit: usize,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -129,56 +116,6 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "Messages edited or deleted recently, with what they said before")]
-    Changes {
-        #[arg(
-            long,
-            default_value = "7d",
-            help = "Changes at or after this time (\"all\" for entire archive)"
-        )]
-        since: String,
-        #[arg(long, help = "Changes before this time")]
-        until: Option<String>,
-        #[arg(long, help = "Limit to one chat (name fragment or id)")]
-        chat: Option<String>,
-        #[arg(long, conflicts_with = "deleted", help = "Show only edited messages")]
-        edited: bool,
-        #[arg(long, conflicts_with = "edited", help = "Show only deleted messages")]
-        deleted: bool,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum results to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Raw Teams records kept in the archive")]
-    Records {
-        #[arg(help = "Raw store source name (omit to list available sources)")]
-        source: Option<String>,
-        #[arg(long, help = "Filter to a single record key")]
-        key: Option<String>,
-        #[arg(long, help = "Only versions captured at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Return every captured version instead of only the latest per key")]
-        all_versions: bool,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum records to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
     #[command(about = "Full-text search across every archived message")]
     Search {
         #[arg(help = "Search words, \"exact phrase\", OR, NOT, or -exclude")]
@@ -216,6 +153,56 @@ pub enum Commands {
         json: bool,
     },
 
+    #[command(about = "Messages that @mention you, newest first")]
+    Mentions {
+        #[arg(long, help = "Only mentions at or after this time")]
+        since: Option<String>,
+        #[arg(long, help = "Only mentions before this time")]
+        until: Option<String>,
+        #[arg(long, help = "Limit to one chat (name fragment or id)")]
+        chat: Option<String>,
+        #[arg(long, help = "Show only mentions marked unread in Teams")]
+        unread: bool,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum mentions to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Messages edited or deleted recently, with what they said before")]
+    Changes {
+        #[arg(
+            long,
+            default_value = "7d",
+            help = "Changes at or after this time (\"all\" for entire archive)"
+        )]
+        since: String,
+        #[arg(long, help = "Changes before this time")]
+        until: Option<String>,
+        #[arg(long, help = "Limit to one chat (name fragment or id)")]
+        chat: Option<String>,
+        #[arg(long, conflicts_with = "deleted", help = "Show only edited messages")]
+        edited: bool,
+        #[arg(long, conflicts_with = "edited", help = "Show only deleted messages")]
+        deleted: bool,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum results to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
     #[command(about = "Files, images and links shared in messages, with their links")]
     Attachments {
         #[arg(help = "Filter by file name or URL substring")]
@@ -244,122 +231,25 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "Download a shared file or pasted image on demand (CLI only)")]
-    Fetch {
-        #[arg(help = "Attachment URL, message id, or filename query")]
-        target: Vec<String>,
-        #[arg(long, help = "Message id (or chatId/msgId) owning the attachment")]
-        message: Option<String>,
-        #[arg(long, help = "1-based attachment index when a message or query has multiple matches")]
-        index: Option<usize>,
-        #[arg(long, help = "Destination file or directory path")]
-        out: Option<String>,
-        #[arg(long, help = "Download from Microsoft even if a local OneDrive copy exists")]
-        force_download: bool,
-        #[arg(
-            long,
-            default_value_t = fetch::DEFAULT_MAX_BYTES,
-            help = "Maximum allowed download size in bytes (default 2 GiB, 0 = unlimited)"
-        )]
-        max_bytes: u64,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "[RESTRICTED] Send a Teams message (CLI only; dry run unless --yes & TEAMS_CLI_ENABLE_SEND=1)")]
-    Send {
-        #[arg(help = "Target conversation id or unambiguous chat name")]
-        target: String,
-        #[arg(help = "Message body text")]
-        message: Vec<String>,
-        #[arg(long, help = "Read message body from stdin")]
-        stdin: bool,
-        #[arg(long, help = "Reply to a numeric channel thread root message id")]
-        reply_to: Option<String>,
-        #[arg(long, help = "Send body as raw HTML instead of escaping plain text")]
-        html: bool,
-        #[arg(long, help = "Explicit numeric client message id (1–32 digits)")]
-        client_message_id: Option<String>,
-        #[arg(long, help = "Preview the request without sending")]
-        dry_run: bool,
-        #[arg(long, help = "Actually send the message (also requires TEAMS_CLI_ENABLE_SEND=1)")]
-        yes: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "People seen in Teams")]
+    #[command(about = "List people seen in Teams, or inspect one person by name, email, or id")]
     People {
-        #[arg(long, help = "Filter by name, email, or job title substring")]
-        grep: Option<String>,
-        #[arg(long, help = "Include bots")]
-        bots: bool,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum people to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "One person: profile, first/last contact, shared chats, recent files")]
-    Person {
-        #[arg(required = true, help = "Name fragment, email, or Teams id")]
+        #[arg(help = "Inspect one person (name fragment, email, or Teams id); omit to list all")]
         person: Vec<String>,
         #[arg(
             long,
-            default_value_t = 20,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum shared chats and recent files to return (0 = all)"
+            conflicts_with = "person",
+            help = "Filter list by name, email, or job title substring"
         )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "What needs attention: unread chats, mentions, awaiting your reply, unread activity")]
-    Inbox {
+        grep: Option<String>,
+        #[arg(long, conflicts_with = "person", help = "Include bots when listing people")]
+        bots: bool,
         #[arg(
             long,
-            default_value = "7d",
-            help = "Activity at or after this time (\"all\" for entire archive)"
-        )]
-        since: String,
-        #[arg(
-            long,
-            default_value_t = 30,
             value_parser = nonneg_int,
             allow_negative_numbers = true,
-            help = "Maximum items per section (0 = all)"
+            help = "Maximum results to return (default 50 for list, 20 for one person; 0 = all)"
         )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Messages that @mention you, newest first")]
-    Mentions {
-        #[arg(long, help = "Only mentions at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only mentions before this time")]
-        until: Option<String>,
-        #[arg(long, help = "Limit to one chat (name fragment or id)")]
-        chat: Option<String>,
-        #[arg(long, help = "Show only mentions marked unread in Teams")]
-        unread: bool,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum mentions to return (0 = all)"
-        )]
-        limit: usize,
+        limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -438,7 +328,7 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "A chat as Markdown (whole history by default)")]
+    #[command(about = "Export a chat as Markdown (whole history by default)")]
     Export {
         #[arg(help = "Chat name fragment or conversation id")]
         chat: String,
@@ -458,99 +348,90 @@ pub enum Commands {
         out: Option<String>,
     },
 
-    #[command(about = "Prove the archive (or one backup FILE) reads end to end; exit 1 if not")]
-    Verify {
-        #[arg(help = "Specific `.sqlite3` or `.sqlite3.xz` backup file to verify")]
-        file: Option<String>,
-        #[arg(long, help = "Skip verifying files in the backups directory")]
-        no_backups: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Replace the archive with a verified backup (dry run unless --yes)")]
-    Restore {
-        #[arg(help = "Path to the `.sqlite3` or `.sqlite3.xz` backup file")]
-        backup: String,
-        #[arg(long, help = "Perform the restore (omit for dry-run verification)")]
-        yes: bool,
-        #[arg(
-            long,
-            help = "Do not save a safety backup of the current archive before replacing it"
-        )]
-        no_safety_backup: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Write a consistent copy of the archive")]
-    Backup {
-        #[arg(
-            long,
-            help = "Destination path (`.sqlite3` or `.sqlite3.xz`); omit for scheduled backup directory"
-        )]
+    #[command(about = "Download a shared file or pasted image on demand (CLI only)")]
+    Fetch {
+        #[arg(help = "Attachment URL, message id, or filename query")]
+        target: Vec<String>,
+        #[arg(long, help = "Message id (or chatId/msgId) owning the attachment")]
+        message: Option<String>,
+        #[arg(long, help = "1-based attachment index when a message or query has multiple matches")]
+        index: Option<usize>,
+        #[arg(long, help = "Destination file or directory path")]
         out: Option<String>,
-    },
-
-    #[command(about = "Re-render every archived message with the current renderer")]
-    Reindex,
-
-    #[command(about = "Run the sync loop and local HTTP API")]
-    Daemon {
-        #[arg(long, help = "Loopback HTTP port (default 47613 or TEAMS_CLI_PORT)")]
-        port: Option<u16>,
+        #[arg(long, help = "Download from Microsoft even if a local OneDrive copy exists")]
+        force_download: bool,
         #[arg(
             long,
-            default_value_t = paths::DEFAULT_SYNC_INTERVAL,
-            value_parser = min_interval,
-            help = "Seconds between lightweight cache refresh checks (minimum 10)"
+            default_value_t = fetch::DEFAULT_MAX_BYTES,
+            help = "Maximum allowed download size in bytes (default 2 GiB, 0 = unlimited)"
         )]
-        interval: u64,
-        #[arg(long, help = "Serve the read-only HTTP API without periodic syncing")]
-        no_sync: bool,
-        #[arg(
-            long = "log-stderr",
-            alias = "foreground",
-            help = "Write daemon logs to stderr instead of daemon.log"
-        )]
-        log_stderr: bool,
+        max_bytes: u64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
 
-    #[command(about = "Manage HTTP API bearer tokens (default: print or --rotate primary token)")]
+    #[command(about = "[RESTRICTED] Send a Teams message (CLI only; dry run unless --yes & TEAMS_CLI_ENABLE_SEND=1)")]
+    Send {
+        #[arg(help = "Target conversation id or unambiguous chat name")]
+        target: String,
+        #[arg(help = "Message body text")]
+        message: Vec<String>,
+        #[arg(long, help = "Read message body from stdin")]
+        stdin: bool,
+        #[arg(long, help = "Reply to a numeric channel thread root message id")]
+        reply_to: Option<String>,
+        #[arg(long, help = "Send body as raw HTML instead of escaping plain text")]
+        html: bool,
+        #[arg(long, help = "Explicit numeric client message id (1–32 digits)")]
+        client_message_id: Option<String>,
+        #[arg(long, help = "Preview the request without sending")]
+        dry_run: bool,
+        #[arg(long, help = "Actually send the message (also requires TEAMS_CLI_ENABLE_SEND=1)")]
+        yes: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Copy new messages from the Teams cache into the archive")]
+    Sync {
+        #[arg(long, help = "Override the Teams IndexedDB directory path")]
+        source: Option<String>,
+        #[arg(long, help = "Re-read the Teams cache even if its file fingerprint is unchanged")]
+        force: bool,
+        #[arg(long, hide = true)]
+        notify: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Archive health, counts and last sync")]
+    Status {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Diagnose local setup: Teams cache permissions, archive, daemon, API auth, and backups")]
+    Doctor {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
+    #[command(about = "Install, manage, inspect logs, or run the background daemon and local HTTP API")]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
+    #[command(about = "Archive maintenance: backup, restore, verify, reindex, and migrations")]
+    Archive {
+        #[command(subcommand)]
+        action: ArchiveAction,
+    },
+
+    #[command(about = "Manage named HTTP API bearer tokens (SHA-256 hashed; secret shown once)")]
     Token {
         #[command(subcommand)]
-        action: Option<TokenAction>,
-        #[arg(
-            long,
-            help = "Replace the primary token in api.token (effective immediately, no restart)"
-        )]
-        rotate: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Install, restart, inspect, or view logs for the background daemon (launchd)")]
-    Agent {
-        #[command(subcommand)]
-        action: AgentAction,
-    },
-
-    #[command(about = "Debug: inspect the live Teams cache directly")]
-    Raw {
-        #[command(subcommand)]
-        action: RawAction,
-    },
-
-    #[command(
-        about = "Print shell completion scripts (bash, zsh, fish, elvish, powershell)",
-        after_long_help = "Examples:\n  \
-            teams completions zsh  > \"${fpath[1]}/_teams\"\n  \
-            teams completions fish > ~/.config/fish/completions/teams.fish\n  \
-            teams completions bash > ~/.local/share/bash-completion/completions/teams"
-    )]
-    Completions {
-        #[arg(value_enum, help = "Target shell")]
-        shell: clap_complete::Shell,
+        action: TokenAction,
     },
 
     #[command(about = "Check for or install the latest teams-cli release from GitHub")]
@@ -570,6 +451,27 @@ pub enum Commands {
         #[arg(long, hide = true)]
         background_check: bool,
     },
+
+    #[command(about = "Inspect raw archived records and the live Teams IndexedDB cache")]
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+
+    #[command(
+        about = "Print shell completion scripts (bash, zsh, fish, elvish, powershell)",
+        after_long_help = "Examples:\n  \
+            teams completions zsh  > \"${fpath[1]}/_teams\"\n  \
+            teams completions fish > ~/.config/fish/completions/teams.fish\n  \
+            teams completions bash > ~/.local/share/bash-completion/completions/teams"
+    )]
+    Completions {
+        #[arg(value_enum, help = "Target shell")]
+        shell: clap_complete::Shell,
+    },
+
+    #[command(about = "Everything on one page: commands, flags, JSON shapes (for agents and scripts)")]
+    Docs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,14 +485,13 @@ impl Commands {
     pub fn update_notice_mode(&self) -> UpdateNoticeMode {
         match self {
             Commands::Docs
-            | Commands::Daemon { .. }
             | Commands::Completions { .. }
-            | Commands::Raw { .. }
+            | Commands::Debug { .. }
             | Commands::Token { .. }
             | Commands::Export { .. }
             | Commands::Update { .. }
-            | Commands::Agent {
-                action: AgentAction::Status,
+            | Commands::Daemon {
+                action: DaemonAction::Run { .. } | DaemonAction::Status | DaemonAction::Logs { follow: true, .. },
             } => UpdateNoticeMode::None,
             Commands::Sync { json, notify, .. } => {
                 if *json || *notify {
@@ -606,33 +507,43 @@ impl Commands {
                     UpdateNoticeMode::CheckOnly
                 }
             }
-            Commands::Doctor { json }
-            | Commands::Migrations { json }
-            | Commands::Chats { json, .. }
-            | Commands::Messages { json, .. }
-            | Commands::Changes { json, .. }
-            | Commands::Records { json, .. }
-            | Commands::Search { json, .. }
-            | Commands::Attachments { json, .. }
-            | Commands::Fetch { json, .. }
-            | Commands::Send { json, .. }
-            | Commands::People { json, .. }
-            | Commands::Person { json, .. }
-            | Commands::Inbox { json, .. }
-            | Commands::Mentions { json, .. }
-            | Commands::Calls { json, .. }
-            | Commands::Meetings { json, .. }
-            | Commands::Saved { json, .. }
-            | Commands::Pinned { json, .. }
-            | Commands::Verify { json, .. }
-            | Commands::Restore { json, .. } => {
+            Commands::Archive {
+                action:
+                    ArchiveAction::Verify { json, .. }
+                    | ArchiveAction::Restore { json, .. }
+                    | ArchiveAction::Migrations { json },
+            } => {
                 if *json {
                     UpdateNoticeMode::None
                 } else {
                     UpdateNoticeMode::Full
                 }
             }
-            Commands::Backup { .. } | Commands::Reindex | Commands::Agent { .. } => UpdateNoticeMode::Full,
+            Commands::Doctor { json }
+            | Commands::Chats { json, .. }
+            | Commands::Messages { json, .. }
+            | Commands::Changes { json, .. }
+            | Commands::Search { json, .. }
+            | Commands::Attachments { json, .. }
+            | Commands::Fetch { json, .. }
+            | Commands::Send { json, .. }
+            | Commands::People { json, .. }
+            | Commands::Inbox { json, .. }
+            | Commands::Mentions { json, .. }
+            | Commands::Calls { json, .. }
+            | Commands::Meetings { json, .. }
+            | Commands::Saved { json, .. }
+            | Commands::Pinned { json, .. } => {
+                if *json {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::Full
+                }
+            }
+            Commands::Archive {
+                action: ArchiveAction::Backup { .. } | ArchiveAction::Reindex,
+            }
+            | Commands::Daemon { .. } => UpdateNoticeMode::Full,
         }
     }
 }
@@ -670,8 +581,8 @@ pub enum TokenAction {
 }
 
 #[derive(Subcommand)]
-pub enum AgentAction {
-    #[command(about = "Install and start the launchd background agent")]
+pub enum DaemonAction {
+    #[command(about = "Install and start the launchd background daemon")]
     Install {
         #[arg(
             long,
@@ -683,11 +594,11 @@ pub enum AgentAction {
         #[arg(long, help = "Loopback HTTP port (default 47613 or TEAMS_CLI_PORT)")]
         port: Option<u16>,
     },
-    #[command(about = "Stop and remove the launchd background agent")]
+    #[command(about = "Stop and remove the launchd background daemon")]
     Uninstall,
-    #[command(about = "Restart the installed launchd background agent")]
+    #[command(about = "Restart the installed launchd background daemon")]
     Restart,
-    #[command(about = "Show launchd agent state as JSON")]
+    #[command(about = "Show launchd daemon state as JSON")]
     Status,
     #[command(about = "Show recent daemon log lines")]
     Logs {
@@ -700,11 +611,96 @@ pub enum AgentAction {
             help = "Number of lines to display from the end of daemon.log"
         )]
         lines: usize,
+        #[arg(long, short = 'f', help = "Follow daemon.log as new lines are appended")]
+        follow: bool,
+    },
+    #[command(about = "Run the sync loop and local HTTP API in the current process")]
+    Run {
+        #[arg(long, help = "Loopback HTTP port (default 47613 or TEAMS_CLI_PORT)")]
+        port: Option<u16>,
+        #[arg(
+            long,
+            default_value_t = paths::DEFAULT_SYNC_INTERVAL,
+            value_parser = min_interval,
+            help = "Seconds between lightweight cache refresh checks (minimum 10)"
+        )]
+        interval: u64,
+        #[arg(long, help = "Serve the read-only HTTP API without periodic syncing")]
+        no_sync: bool,
+        #[arg(
+            long = "log-stderr",
+            alias = "foreground",
+            help = "Write daemon logs to stderr instead of daemon.log"
+        )]
+        log_stderr: bool,
     },
 }
 
 #[derive(Subcommand)]
-pub enum RawAction {
+pub enum ArchiveAction {
+    #[command(about = "Write a consistent verified backup of the archive")]
+    Backup {
+        #[arg(
+            long,
+            help = "Destination path (`.sqlite3` or `.sqlite3.xz`); omit for scheduled backup directory"
+        )]
+        out: Option<String>,
+    },
+    #[command(about = "Replace the archive with a verified backup (dry run unless --yes)")]
+    Restore {
+        #[arg(help = "Path to the `.sqlite3` or `.sqlite3.xz` backup file")]
+        backup: String,
+        #[arg(long, help = "Perform the restore (omit for dry-run verification)")]
+        yes: bool,
+        #[arg(
+            long,
+            help = "Do not save a safety backup of the current archive before replacing it"
+        )]
+        no_safety_backup: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Prove the archive (or one backup FILE) reads end to end; exit 1 if not")]
+    Verify {
+        #[arg(help = "Specific `.sqlite3` or `.sqlite3.xz` backup file to verify")]
+        file: Option<String>,
+        #[arg(long, help = "Skip verifying files in the backups directory")]
+        no_backups: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Re-render every archived message with the current renderer")]
+    Reindex,
+    #[command(about = "Show archive schema version, applied migration ledger, and any pending upgrades")]
+    Migrations {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DebugAction {
+    #[command(about = "Raw Teams records kept in the archive")]
+    Records {
+        #[arg(help = "Raw store source name (omit to list available sources)")]
+        source: Option<String>,
+        #[arg(long, help = "Filter to a single record key")]
+        key: Option<String>,
+        #[arg(long, help = "Only versions captured at or after this time")]
+        since: Option<String>,
+        #[arg(long, help = "Return every captured version instead of only the latest per key")]
+        all_versions: bool,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum records to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
     #[command(about = "List IndexedDB databases and object stores in the live Teams cache")]
     Stores,
     #[command(about = "Dump decoded JSON records from a specific database and store")]
@@ -852,7 +848,7 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                     d["pid"].as_str().unwrap_or("?")
                 );
             } else {
-                println!("Daemon    not installed - run `teams agent install`");
+                println!("Daemon    not installed - run `teams daemon install`");
             }
             println!(
                 "Backups   {} (latest: {})",
@@ -900,53 +896,6 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 }
             }
             Ok(if ok { 0 } else { 1 })
-        }
-        Commands::Migrations { json } => {
-            let conn = api::open_archive_readonly()?;
-            let current: i64 = conn
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .map_err(|e| CliError::Runtime(e.to_string()))?;
-            let applied = migrations::history(&conn)?;
-            let pending = migrations::pending(&conn)?;
-            if json {
-                fmt::print_json(&json!({
-                    "currentVersion": current,
-                    "targetVersion": archive::SCHEMA_VERSION,
-                    "applied": applied.iter().map(|m| json!({
-                        "version": m.version,
-                        "name": m.name,
-                        "appliedAt": iso((m.applied_at != 0).then_some(m.applied_at)),
-                        "appliedAtMs": m.applied_at,
-                        "appVersion": m.app_version,
-                        "durationMs": m.duration_ms,
-                    })).collect::<Vec<_>>(),
-                    "pending": pending.iter().map(|m| json!({
-                        "version": m.version,
-                        "name": m.name,
-                        "description": m.description,
-                    })).collect::<Vec<_>>(),
-                }));
-                return Ok(0);
-            }
-            println!("Schema version: v{current} (target v{})", archive::SCHEMA_VERSION);
-            for m in &applied {
-                let when = if m.applied_at == 0 {
-                    "backfill".to_string()
-                } else {
-                    short(Some(m.applied_at))
-                };
-                println!(
-                    "  v{:<3} {:<44} {:<16} app={} ({}ms)",
-                    m.version, m.name, when, m.app_version, m.duration_ms
-                );
-            }
-            if !pending.is_empty() {
-                println!("\nPending:");
-                for m in &pending {
-                    println!("  v{:<3} {:<44} {}", m.version, m.name, m.description);
-                }
-            }
-            Ok(0)
         }
         Commands::Chats {
             grep,
@@ -1397,45 +1346,8 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             );
             Ok(0)
         }
-        Commands::Records {
-            source,
-            key,
-            since,
-            all_versions,
-            limit,
-            json,
-        } => {
-            let conn = api::open_archive_readonly()?;
-            match source {
-                None => {
-                    let r = api::record_sources(&conn)?;
-                    if json {
-                        fmt::print_json(&r);
-                    } else if let Some(srcs) = r["sources"].as_array() {
-                        for s in srcs {
-                            println!(
-                                "{:<58} {:>6} records {:>7} versions  last {}",
-                                s["source"].as_str().unwrap_or(""),
-                                s["records"].as_i64().unwrap_or(0),
-                                s["versions"].as_i64().unwrap_or(0),
-                                s["lastCaptured"].as_str().unwrap_or("-")
-                            );
-                        }
-                    }
-                    Ok(0)
-                }
-                Some(src) => {
-                    let r = api::records(&conn, &src, key.as_deref(), since.as_deref(), limit, all_versions)?;
-                    if let Some(recs) = r["records"].as_array() {
-                        for rec in recs {
-                            println!("{}", json_codec::to_string(rec));
-                        }
-                    }
-                    Ok(0)
-                }
-            }
-        }
         Commands::People {
+            person,
             grep,
             bots,
             limit,
@@ -1443,7 +1355,79 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
         } => {
             let conn = api::open_archive_readonly()?;
             api::require_data(&conn)?;
-            let r = api::people(&conn, grep.as_deref(), limit, bots)?;
+            if !person.is_empty() {
+                let r = api::person(&conn, &person.join(" "), limit.unwrap_or(20))?;
+                if json {
+                    fmt::print_json(&r);
+                    return Ok(0);
+                }
+                let p = &r["person"];
+                if let Some(others) = r["otherMatches"].as_array().filter(|o| !o.is_empty()) {
+                    let ns: Vec<String> = others
+                        .iter()
+                        .map(|o| {
+                            let name = o["name"]
+                                .as_str()
+                                .or(o["email"].as_str())
+                                .or(o["id"].as_str())
+                                .unwrap_or("?");
+                            format!("{name} ({})", o["messagesInArchive"])
+                        })
+                        .collect();
+                    eprintln!(
+                        "# Using {}. Other matches: {}",
+                        Quoted(p["name"].as_str().unwrap_or("?")),
+                        ns.join(", ")
+                    );
+                }
+                let email = p["email"].as_str().map(|e| format!("  <{e}>")).unwrap_or_default();
+                println!("{}{email}", p["name"].as_str().unwrap_or("?"));
+                let role: Vec<&str> = [p["jobTitle"].as_str(), p["department"].as_str()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !role.is_empty() {
+                    println!("{}", role.join(" · "));
+                }
+                println!("id        {}", p["id"].as_str().unwrap_or(""));
+                println!(
+                    "messages  {}  (first {}, last {})",
+                    p["messagesInArchive"],
+                    p["firstContact"].as_str().unwrap_or("-"),
+                    p["lastContact"].as_str().unwrap_or("-")
+                );
+                println!("\n# Shared chats ({})", r["totalSharedChats"]);
+                if let Some(sc) = r["sharedChats"].as_array() {
+                    for c in sc {
+                        let cname: String = c["name"].as_str().unwrap_or("").chars().take(60).collect();
+                        println!(
+                            "{}  {:<9} {:>5} from them  {cname:<60}  {}",
+                            short(c["lastActivityMs"].as_i64()),
+                            c["kind"].as_str().unwrap_or(""),
+                            c["messagesFromPerson"].as_i64().unwrap_or(0),
+                            c["id"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                println!("\n# Recent files and links ({})", r["totalAttachments"]);
+                if let Some(rf) = r["recentFiles"].as_array() {
+                    for f in rf {
+                        let k = f["kind"].as_str().unwrap_or("");
+                        let u = f["url"].as_str().unwrap_or("");
+                        let n = f["name"].as_str().unwrap_or("");
+                        let name = if k == "image" || n == u || n.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{n}  ")
+                        };
+                        let where_s = f["chatName"].as_str().or(f["chatId"].as_str()).unwrap_or("");
+                        println!("[{}] [{k}] {name}{u}  @ {where_s}", short(f["timeMs"].as_i64()));
+                    }
+                }
+                return Ok(0);
+            }
+            let r = api::people(&conn, grep.as_deref(), limit.unwrap_or(50), bots)?;
             if json {
                 fmt::print_json(&r);
                 return Ok(0);
@@ -1457,80 +1441,6 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                         "{n:<34} {e:<40} {j:<30} {:>5}",
                         p["messagesInArchive"].as_i64().unwrap_or(0)
                     );
-                }
-            }
-            Ok(0)
-        }
-        Commands::Person { person, limit, json } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let r = api::person(&conn, &person.join(" "), limit)?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            let p = &r["person"];
-            if let Some(others) = r["otherMatches"].as_array().filter(|o| !o.is_empty()) {
-                let ns: Vec<String> = others
-                    .iter()
-                    .map(|o| {
-                        let name = o["name"]
-                            .as_str()
-                            .or(o["email"].as_str())
-                            .or(o["id"].as_str())
-                            .unwrap_or("?");
-                        format!("{name} ({})", o["messagesInArchive"])
-                    })
-                    .collect();
-                eprintln!(
-                    "# Using {}. Other matches: {}",
-                    Quoted(p["name"].as_str().unwrap_or("?")),
-                    ns.join(", ")
-                );
-            }
-            let email = p["email"].as_str().map(|e| format!("  <{e}>")).unwrap_or_default();
-            println!("{}{email}", p["name"].as_str().unwrap_or("?"));
-            let role: Vec<&str> = [p["jobTitle"].as_str(), p["department"].as_str()]
-                .into_iter()
-                .flatten()
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !role.is_empty() {
-                println!("{}", role.join(" · "));
-            }
-            println!("id        {}", p["id"].as_str().unwrap_or(""));
-            println!(
-                "messages  {}  (first {}, last {})",
-                p["messagesInArchive"],
-                p["firstContact"].as_str().unwrap_or("-"),
-                p["lastContact"].as_str().unwrap_or("-")
-            );
-            println!("\n# Shared chats ({})", r["totalSharedChats"]);
-            if let Some(sc) = r["sharedChats"].as_array() {
-                for c in sc {
-                    let cname: String = c["name"].as_str().unwrap_or("").chars().take(60).collect();
-                    println!(
-                        "{}  {:<9} {:>5} from them  {cname:<60}  {}",
-                        short(c["lastActivityMs"].as_i64()),
-                        c["kind"].as_str().unwrap_or(""),
-                        c["messagesFromPerson"].as_i64().unwrap_or(0),
-                        c["id"].as_str().unwrap_or("")
-                    );
-                }
-            }
-            println!("\n# Recent files and links ({})", r["totalAttachments"]);
-            if let Some(rf) = r["recentFiles"].as_array() {
-                for f in rf {
-                    let k = f["kind"].as_str().unwrap_or("");
-                    let u = f["url"].as_str().unwrap_or("");
-                    let n = f["name"].as_str().unwrap_or("");
-                    let name = if k == "image" || n == u || n.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{n}  ")
-                    };
-                    let where_s = f["chatName"].as_str().or(f["chatId"].as_str()).unwrap_or("");
-                    println!("[{}] [{k}] {name}{u}  @ {where_s}", short(f["timeMs"].as_i64()));
                 }
             }
             Ok(0)
@@ -1814,183 +1724,231 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             }
             Ok(0)
         }
-        Commands::Verify { file, no_backups, json } => {
-            let target = file.as_deref().map(paths::expanduser);
-            let res = backups::verify_archive(None, target.as_deref(), !no_backups);
-            let ok = res["ok"].as_bool().unwrap_or(false);
-            if json {
-                fmt::print_json(&res);
-                return Ok(if ok { 0 } else { 1 });
-            }
-            let label = res["target"].as_str().or(res["archive"].as_str()).unwrap_or("");
-            println!("{}  {label}", if ok { "OK" } else { "FAILED" });
-            if let Some(ch) = res["checks"].as_object() {
-                for (k, v) in ch {
-                    let s = if let Some(b) = v.as_bool() {
-                        if b {
-                            "ok".to_string()
+        Commands::Archive { action } => match action {
+            ArchiveAction::Verify { file, no_backups, json } => {
+                let target = file.as_deref().map(paths::expanduser);
+                let res = backups::verify_archive(None, target.as_deref(), !no_backups);
+                let ok = res["ok"].as_bool().unwrap_or(false);
+                if json {
+                    fmt::print_json(&res);
+                    return Ok(if ok { 0 } else { 1 });
+                }
+                let label = res["target"].as_str().or(res["archive"].as_str()).unwrap_or("");
+                println!("{}  {label}", if ok { "OK" } else { "FAILED" });
+                if let Some(ch) = res["checks"].as_object() {
+                    for (k, v) in ch {
+                        let s = if let Some(b) = v.as_bool() {
+                            if b {
+                                "ok".to_string()
+                            } else {
+                                "FAILED".to_string()
+                            }
+                        } else if let Some(rows) = v.get("rows").and_then(|x| x.as_u64()) {
+                            let bad = v.get("bad").and_then(|x| x.as_u64()).unwrap_or(0);
+                            if bad > 0 {
+                                format!("{rows} versions decode, {bad} do not")
+                            } else {
+                                format!("{rows} versions decode")
+                            }
                         } else {
-                            "FAILED".to_string()
-                        }
-                    } else if let Some(rows) = v.get("rows").and_then(|x| x.as_u64()) {
-                        let bad = v.get("bad").and_then(|x| x.as_u64()).unwrap_or(0);
-                        if bad > 0 {
-                            format!("{rows} versions decode, {bad} do not")
-                        } else {
-                            format!("{rows} versions decode")
-                        }
-                    } else {
-                        v.to_string()
-                    };
-                    println!("  {k:<24} {s}");
-                }
-            }
-            if let Some(bks) = res["backups"].as_array().filter(|b| !b.is_empty()) {
-                let good = bks.iter().filter(|b| b["ok"].as_bool().unwrap_or(false)).count();
-                println!("  backups                  {good} of {} pass quick_check", bks.len());
-            }
-            for e in res["errors"].as_array().into_iter().flatten() {
-                if let Some(s) = e.as_str() {
-                    eprintln!("! {s}");
-                }
-            }
-            Ok(if ok { 0 } else { 1 })
-        }
-        Commands::Restore {
-            backup,
-            yes,
-            no_safety_backup,
-            json,
-        } => {
-            let bpath = paths::expanduser(&backup);
-            if yes {
-                let name = bpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !bpath.is_file() {
-                    return Err(CliError::Runtime(format!(
-                        "{} failed verification: file does not exist",
-                        bpath.display()
-                    )));
-                }
-                if !(name.ends_with(".sqlite3") || name.ends_with(".sqlite3.xz")) {
-                    return Err(CliError::Runtime(format!(
-                        "{} failed verification: not a .sqlite3 or .sqlite3.xz backup",
-                        bpath.display()
-                    )));
-                }
-                return restore_now(&bpath, no_safety_backup, json);
-            }
-            let check = backups::verify_archive(None, Some(&bpath), false);
-            if !check["ok"].as_bool().unwrap_or(false) {
-                let errs: Vec<&str> = check["errors"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .take(3)
-                    .filter_map(|v| v.as_str())
-                    .collect();
-                return Err(CliError::Runtime(format!(
-                    "{} failed verification: {}",
-                    bpath.display(),
-                    errs.join("; ")
-                )));
-            }
-            let dest = paths::archive_path().to_string_lossy().into_owned();
-            if json {
-                fmt::print_json(&json!({
-                    "dryRun": true,
-                    "backup": bpath.to_string_lossy(),
-                    "verified": true,
-                    "archive": dest,
-                }));
-                return Ok(0);
-            }
-            println!("Backup {} verified OK.", bpath.display());
-            println!("Restoring will:");
-            println!("  1. stop the background daemon, if it is running");
-            if !no_safety_backup {
-                println!(
-                    "  2. save a permanent safety backup of the current archive in {}",
-                    paths::backups_dir().display()
-                );
-            }
-            println!(
-                "  {}. replace {dest} with the backup, then restart the daemon",
-                if !no_safety_backup { 3 } else { 2 }
-            );
-            println!("Nothing has changed yet. Re-run with --yes to proceed.");
-            Ok(0)
-        }
-        Commands::Backup { out } => {
-            let conn = archive::connect(None)?;
-            let dest = if let Some(o) = out {
-                backups::backup(&conn, &paths::expanduser(&o))?
-            } else {
-                let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
-                backups::backup_if_due(&conn, 0.0)?.ok_or_else(|| CliError::Runtime("Backup skipped".to_string()))?
-            };
-            println!("Backup written: {}", dest.display());
-            Ok(0)
-        }
-        Commands::Reindex => {
-            let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
-            let conn = archive::connect(None)?;
-            let n = archive::rerender(&conn, true)?;
-            println!("Re-rendered {n} messages from stored HTML.");
-            Ok(0)
-        }
-        Commands::Daemon {
-            port,
-            interval,
-            no_sync,
-            log_stderr,
-        } => {
-            daemon::serve(port, interval, !no_sync, !log_stderr).map_err(CliError::Runtime)?;
-            Ok(0)
-        }
-        Commands::Token { action, rotate, json } => match action {
-            None => {
-                let env_token = daemon::env_api_token();
-                let token = if rotate {
-                    let t = daemon::rotate_api_token().map_err(CliError::Runtime)?;
-                    if env_token.is_some() {
-                        eprintln!(
-                            "teams: note: {} is set and overrides {}; the daemon keeps using the environment token",
-                            daemon::API_TOKEN_ENV,
-                            paths::api_token_path().display()
-                        );
+                            v.to_string()
+                        };
+                        println!("  {k:<24} {s}");
                     }
-                    t
-                } else {
-                    daemon::load_or_create_api_token().map_err(CliError::Runtime)?
-                };
-                let (shown, source) = match env_token {
-                    Some(t) if !rotate => (t, "env"),
-                    _ => (token, "file"),
-                };
+                }
+                if let Some(bks) = res["backups"].as_array().filter(|b| !b.is_empty()) {
+                    let good = bks.iter().filter(|b| b["ok"].as_bool().unwrap_or(false)).count();
+                    println!("  backups                  {good} of {} pass quick_check", bks.len());
+                }
+                for e in res["errors"].as_array().into_iter().flatten() {
+                    if let Some(s) = e.as_str() {
+                        eprintln!("! {s}");
+                    }
+                }
+                Ok(if ok { 0 } else { 1 })
+            }
+            ArchiveAction::Restore {
+                backup,
+                yes,
+                no_safety_backup,
+                json,
+            } => {
+                let bpath = paths::expanduser(&backup);
+                if yes {
+                    let name = bpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !bpath.is_file() {
+                        return Err(CliError::Runtime(format!(
+                            "{} failed verification: file does not exist",
+                            bpath.display()
+                        )));
+                    }
+                    if !(name.ends_with(".sqlite3") || name.ends_with(".sqlite3.xz")) {
+                        return Err(CliError::Runtime(format!(
+                            "{} failed verification: not a .sqlite3 or .sqlite3.xz backup",
+                            bpath.display()
+                        )));
+                    }
+                    return restore_now(&bpath, no_safety_backup, json);
+                }
+                let check = backups::verify_archive(None, Some(&bpath), false);
+                if !check["ok"].as_bool().unwrap_or(false) {
+                    let errs: Vec<&str> = check["errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(3)
+                        .filter_map(|v| v.as_str())
+                        .collect();
+                    return Err(CliError::Runtime(format!(
+                        "{} failed verification: {}",
+                        bpath.display(),
+                        errs.join("; ")
+                    )));
+                }
+                let dest = paths::archive_path().to_string_lossy().into_owned();
                 if json {
                     fmt::print_json(&json!({
-                        "token": shown,
-                        "path": paths::api_token_path().to_string_lossy(),
-                        "source": source,
+                        "dryRun": true,
+                        "backup": bpath.to_string_lossy(),
+                        "verified": true,
+                        "archive": dest,
                     }));
+                    return Ok(0);
+                }
+                println!("Backup {} verified OK.", bpath.display());
+                println!("Restoring will:");
+                println!("  1. stop the background daemon, if it is running");
+                if !no_safety_backup {
+                    println!(
+                        "  2. save a permanent safety backup of the current archive in {}",
+                        paths::backups_dir().display()
+                    );
+                }
+                println!(
+                    "  {}. replace {dest} with the backup, then restart the daemon",
+                    if !no_safety_backup { 3 } else { 2 }
+                );
+                println!("Nothing has changed yet. Re-run with --yes to proceed.");
+                Ok(0)
+            }
+            ArchiveAction::Backup { out } => {
+                let conn = archive::connect(None)?;
+                let dest = if let Some(o) = out {
+                    backups::backup(&conn, &paths::expanduser(&o))?
                 } else {
-                    println!("{shown}");
+                    let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
+                    backups::backup_if_due(&conn, 0.0)?
+                        .ok_or_else(|| CliError::Runtime("Backup skipped".to_string()))?
+                };
+                println!("Backup written: {}", dest.display());
+                Ok(0)
+            }
+            ArchiveAction::Reindex => {
+                let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
+                let conn = archive::connect(None)?;
+                let n = archive::rerender(&conn, true)?;
+                println!("Re-rendered {n} messages from stored HTML.");
+                Ok(0)
+            }
+            ArchiveAction::Migrations { json } => {
+                let conn = api::open_archive_readonly()?;
+                let current: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .map_err(|e| CliError::Runtime(e.to_string()))?;
+                let applied = migrations::history(&conn)?;
+                let pending = migrations::pending(&conn)?;
+                if json {
+                    fmt::print_json(&json!({
+                        "currentVersion": current,
+                        "targetVersion": archive::SCHEMA_VERSION,
+                        "applied": applied.iter().map(|m| json!({
+                            "version": m.version,
+                            "name": m.name,
+                            "appliedAt": iso((m.applied_at != 0).then_some(m.applied_at)),
+                            "appliedAtMs": m.applied_at,
+                            "appVersion": m.app_version,
+                            "durationMs": m.duration_ms,
+                        })).collect::<Vec<_>>(),
+                        "pending": pending.iter().map(|m| json!({
+                            "version": m.version,
+                            "name": m.name,
+                            "description": m.description,
+                        })).collect::<Vec<_>>(),
+                    }));
+                    return Ok(0);
+                }
+                println!("Schema version: v{current} (target v{})", archive::SCHEMA_VERSION);
+                for m in &applied {
+                    let when = if m.applied_at == 0 {
+                        "backfill".to_string()
+                    } else {
+                        short(Some(m.applied_at))
+                    };
+                    println!(
+                        "  v{:<3} {:<44} {:<16} app={} ({}ms)",
+                        m.version, m.name, when, m.app_version, m.duration_ms
+                    );
+                }
+                if !pending.is_empty() {
+                    println!("\nPending:");
+                    for m in &pending {
+                        println!("  v{:<3} {:<44} {}", m.version, m.name, m.description);
+                    }
                 }
                 Ok(0)
             }
-            Some(TokenAction::Create {
-                name,
-                expires,
-                json: sub_json,
-            }) => {
+        },
+        Commands::Daemon { action } => match action {
+            DaemonAction::Install { interval, port } => {
+                let path = launchd::install(interval, port).map_err(CliError::Runtime)?;
+                println!(
+                    "Installed {}\nThe daemon checks for updates every {} and serves http://127.0.0.1:{}",
+                    path.display(),
+                    interval_label(interval),
+                    port.unwrap_or_else(paths::port)
+                );
+                println!("Logs: {}", paths::log_dir().display());
+                Ok(0)
+            }
+            DaemonAction::Uninstall => {
+                println!(
+                    "{}",
+                    if launchd::uninstall() {
+                        "Removed."
+                    } else {
+                        "Not installed."
+                    }
+                );
+                Ok(0)
+            }
+            DaemonAction::Restart => {
+                let path = launchd::restart().map_err(CliError::Runtime)?;
+                println!("Restarted {}.", path.display());
+                Ok(0)
+            }
+            DaemonAction::Status => {
+                fmt::print_json(&launchd::status());
+                Ok(0)
+            }
+            DaemonAction::Logs { lines, follow } => {
+                let log_path = paths::log_dir().join("daemon.log");
+                tail_daemon_log(&log_path, lines, follow).map_err(CliError::Runtime)?;
+                Ok(0)
+            }
+            DaemonAction::Run {
+                port,
+                interval,
+                no_sync,
+                log_stderr,
+            } => {
+                daemon::serve(port, interval, !no_sync, !log_stderr).map_err(CliError::Runtime)?;
+                Ok(0)
+            }
+        },
+        Commands::Token { action } => match action {
+            TokenAction::Create { name, expires, json } => {
                 let res = daemon::create_named_token(&name, expires.as_deref()).map_err(CliError::Runtime)?;
-                if daemon::env_api_token().is_some() {
-                    eprintln!(
-                        "teams: note: {} is set and overrides token files while active",
-                        daemon::API_TOKEN_ENV
-                    );
-                }
-                if json || sub_json {
+                if json {
                     fmt::print_json(&res);
                 } else {
                     println!("{}", res["token"].as_str().unwrap_or(""));
@@ -2004,12 +1962,9 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 }
                 Ok(0)
             }
-            Some(TokenAction::List {
-                include_expired,
-                json: sub_json,
-            }) => {
+            TokenAction::List { include_expired, json } => {
                 let res = daemon::list_named_tokens(include_expired).map_err(CliError::Runtime)?;
-                if json || sub_json {
+                if json {
                     fmt::print_json(&res);
                     return Ok(0);
                 }
@@ -2036,9 +1991,9 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 }
                 Ok(0)
             }
-            Some(TokenAction::Revoke { target, json: sub_json }) => {
+            TokenAction::Revoke { target, json } => {
                 let res = daemon::revoke_named_token(&target).map_err(CliError::Runtime)?;
-                if json || sub_json {
+                if json {
                     fmt::print_json(&res);
                 } else {
                     println!(
@@ -2049,9 +2004,9 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 }
                 Ok(0)
             }
-            Some(TokenAction::Prune { json: sub_json }) => {
+            TokenAction::Prune { json } => {
                 let res = daemon::prune_expired_tokens().map_err(CliError::Runtime)?;
-                if json || sub_json {
+                if json {
                     fmt::print_json(&res);
                 } else {
                     println!(
@@ -2062,83 +2017,77 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 Ok(0)
             }
         },
-        Commands::Agent { action } => match action {
-            AgentAction::Install { interval, port } => {
-                let path = launchd::install(interval, port).map_err(CliError::Runtime)?;
-                println!(
-                    "Installed {}\nThe daemon checks for updates every {} and serves http://127.0.0.1:{}",
-                    path.display(),
-                    interval_label(interval),
-                    port.unwrap_or_else(paths::port)
-                );
-                println!("Logs: {}", paths::log_dir().display());
-                Ok(0)
-            }
-            AgentAction::Uninstall => {
-                println!(
-                    "{}",
-                    if launchd::uninstall() {
-                        "Removed."
-                    } else {
-                        "Not installed."
+        Commands::Debug { action } => match action {
+            DebugAction::Records {
+                source,
+                key,
+                since,
+                all_versions,
+                limit,
+                json,
+            } => {
+                let conn = api::open_archive_readonly()?;
+                match source {
+                    None => {
+                        let r = api::record_sources(&conn)?;
+                        if json {
+                            fmt::print_json(&r);
+                        } else if let Some(srcs) = r["sources"].as_array() {
+                            for s in srcs {
+                                println!(
+                                    "{:<58} {:>6} records {:>7} versions  last {}",
+                                    s["source"].as_str().unwrap_or(""),
+                                    s["records"].as_i64().unwrap_or(0),
+                                    s["versions"].as_i64().unwrap_or(0),
+                                    s["lastCaptured"].as_str().unwrap_or("-")
+                                );
+                            }
+                        }
+                        Ok(0)
                     }
-                );
+                    Some(src) => {
+                        let r = api::records(&conn, &src, key.as_deref(), since.as_deref(), limit, all_versions)?;
+                        if let Some(recs) = r["records"].as_array() {
+                            for rec in recs {
+                                println!("{}", json_codec::to_string(rec));
+                            }
+                        }
+                        Ok(0)
+                    }
+                }
+            }
+            DebugAction::Stores => {
+                let cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
+                    .map_err(|e| CliError::Runtime(e.to_string()))?;
+                for name in cache.database_names() {
+                    println!("{name}\n    {}", cache.stores(&name).join(", "));
+                }
                 Ok(0)
             }
-            AgentAction::Restart => {
-                let path = launchd::restart().map_err(CliError::Runtime)?;
-                println!("Restarted {}.", path.display());
-                Ok(0)
-            }
-            AgentAction::Status => {
-                fmt::print_json(&launchd::status());
-                Ok(0)
-            }
-            AgentAction::Logs { lines } => {
-                let log_path = paths::log_dir().join("daemon.log");
-                let text = std::fs::read_to_string(&log_path)
-                    .map_err(|e| CliError::Runtime(format!("Could not read {}: {e}", log_path.display())))?;
-                let all: Vec<&str> = text.lines().collect();
-                let start = if lines == 0 { 0 } else { all.len().saturating_sub(lines) };
-                for line in &all[start..] {
-                    println!("{line}");
+            DebugAction::Dump { db, store } => {
+                let mut cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
+                    .map_err(|e| CliError::Runtime(e.to_string()))?;
+                let matches: Vec<String> = cache.database_names().into_iter().filter(|n| n.contains(&db)).collect();
+                let Some(first_db) = matches.first() else {
+                    eprintln!("No database name contains {}", Quoted(&db));
+                    return Ok(2);
+                };
+                let stores = cache.stores(first_db);
+                if !stores.iter().any(|s| s == &store) {
+                    let avail = if stores.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        stores.join(", ")
+                    };
+                    eprintln!("No store {} in {first_db}. Stores: {avail}", Quoted(&store));
+                    return Ok(2);
+                }
+                for (k, v) in cache.raw_records_with_keys(first_db, &store) {
+                    println!("{}", json_codec::to_string(&json!({"key": k, "value": v})));
                 }
                 Ok(0)
             }
         },
-        Commands::Raw { action } => {
-            let mut cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
-                .map_err(|e| CliError::Runtime(e.to_string()))?;
-            match action {
-                RawAction::Stores => {
-                    for name in cache.database_names() {
-                        println!("{name}\n    {}", cache.stores(&name).join(", "));
-                    }
-                    Ok(0)
-                }
-                RawAction::Dump { db, store } => {
-                    let matches: Vec<String> = cache.database_names().into_iter().filter(|n| n.contains(&db)).collect();
-                    let Some(first_db) = matches.first() else {
-                        eprintln!("No database name contains {}", Quoted(&db));
-                        return Ok(2);
-                    };
-                    let stores = cache.stores(first_db);
-                    if !stores.iter().any(|s| s == &store) {
-                        let avail = if stores.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            stores.join(", ")
-                        };
-                        eprintln!("No store {} in {first_db}. Stores: {avail}", Quoted(&store));
-                        return Ok(2);
-                    }
-                    for (k, v) in cache.raw_records_with_keys(first_db, &store) {
-                        println!("{}", json_codec::to_string(&json!({"key": k, "value": v})));
-                    }
-                    Ok(0)
-                }
-            }
-        }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "teams", &mut std::io::stdout());
@@ -2198,7 +2147,7 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 }
             }
             if let Some(ref err) = outcome.daemon_restart_error {
-                eprintln!("teams: daemon restart failed ({err}); run `teams agent restart`");
+                eprintln!("teams: daemon restart failed ({err}); run `teams daemon restart`");
                 return Ok(1);
             }
             Ok(0)
@@ -2207,10 +2156,16 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
 }
 
 fn restore_now(bpath: &std::path::Path, no_safety_backup: bool, json: bool) -> Result<i32, CliError> {
-    let was_loaded = launchd::status()["loaded"].as_bool().unwrap_or(false);
+    let manages_default_home = std::env::var_os("TEAMS_CLI_HOME").filter(|v| !v.is_empty()).is_none();
+    let was_loaded = if manages_default_home {
+        let st = launchd::status();
+        st["installed"].as_bool().unwrap_or(false) && st["loaded"].as_bool().unwrap_or(false)
+    } else {
+        false
+    };
     if was_loaded && !launchd::stop(20.0) {
         return Err(CliError::Runtime(
-            "Could not stop the running daemon; run `teams agent uninstall` and retry.".to_string(),
+            "Could not stop the running daemon; run `teams daemon uninstall` and retry.".to_string(),
         ));
     }
     let res_inner = (|| -> Result<Value, CliError> {
@@ -2243,7 +2198,7 @@ fn restore_now(bpath: &std::path::Path, no_safety_backup: bool, json: bool) -> R
         }
     }
     if let Some(re) = restart_err {
-        eprintln!("teams: daemon restart failed ({re}); run `teams agent install`");
+        eprintln!("teams: daemon restart failed ({re}); run `teams daemon install`");
         return Ok(1);
     }
     Ok(0)
@@ -2268,6 +2223,67 @@ pub fn interval_label(seconds: u64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn tail_daemon_log(log_path: &std::path::Path, lines: usize, follow: bool) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let text = std::fs::read_to_string(log_path).map_err(|e| format!("Could not read {}: {e}", log_path.display()))?;
+    let all: Vec<&str> = text.lines().collect();
+    let start = if lines == 0 { 0 } else { all.len().saturating_sub(lines) };
+    let mut stdout = std::io::stdout().lock();
+    for line in &all[start..] {
+        if writeln!(stdout, "{line}").is_err() {
+            return Ok(());
+        }
+    }
+    let _ = stdout.flush();
+    if !follow {
+        return Ok(());
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let _ = ctrlc::set_handler(move || {
+        stop_flag.store(true, Ordering::SeqCst);
+    });
+
+    let mut pos = text.len() as u64;
+    let mut ino = std::fs::metadata(log_path).map(|m| m.ino()).unwrap_or(0);
+    let mut buf = Vec::new();
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(250));
+        let Ok(meta) = std::fs::metadata(log_path) else {
+            continue;
+        };
+        let cur_ino = meta.ino();
+        let cur_len = meta.len();
+        if cur_ino != ino || cur_len < pos {
+            ino = cur_ino;
+            pos = 0;
+        }
+        if cur_len == pos {
+            continue;
+        }
+        let Ok(mut f) = std::fs::File::open(log_path) else {
+            continue;
+        };
+        if f.seek(SeekFrom::Start(pos)).is_err() {
+            continue;
+        }
+        buf.clear();
+        if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            pos += buf.len() as u64;
+            if stdout.write_all(&buf).is_err() || stdout.flush().is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn docs_text() -> String {

@@ -31,9 +31,9 @@ const teamsArchive = defineProvider({
   auth: {
     token: secrets({
       label: "API token",
-      guide: "Run `teams token` on your Mac and paste the token below.",
+      guide: "Run `teams token create executor` on your Mac and paste the token below.",
       fields: object({
-        token: string({ description: "Bearer token printed by `teams token`" }),
+        token: string({ description: "Bearer token created by `teams token create executor`" }),
       }),
       request: ({ token }) => bearer(token),
     }),
@@ -499,7 +499,7 @@ async function call(
     res = await ctx.fetch(url.toString(), { method, cache: "no-store", headers });
   } catch (e) {
     throw new Error(
-      "The local Teams archive isn't reachable at " + BASE + ". On the Mac, run `teams agent install` " +
+      "The local Teams archive isn't reachable at " + BASE + ". On the Mac, run `teams daemon install` " +
         "(or `teams status` to diagnose). " + String(e),
     );
   }
@@ -509,7 +509,9 @@ async function call(
   if (!res.ok || body.error) {
     const details = body.error?.details !== undefined ? ` (${JSON.stringify(body.error.details)})` : "";
     const hint =
-      res.status === 401 ? " Reconnect the Teams Archive account with the token `teams token` prints." : "";
+      res.status === 401
+        ? " Create a new token with `teams token create executor` and reconnect the Teams Archive account."
+        : "";
     throw new Error(
       `teams ${body.error?.code ?? res.status}: ${body.error?.message ?? res.statusText}${details}${hint}`,
     );

@@ -2221,10 +2221,9 @@ pub fn status(conn: &Connection) -> Result<Value, ApiError> {
     let scheduled_bks: Vec<&PathBuf> = bks
         .iter()
         .filter(|p| {
-            !p.file_name()
+            p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("archive-before-restore-"))
-                .unwrap_or(false)
+                .is_some_and(backups::is_scheduled_backup)
         })
         .collect();
     let free = paths::disk_free_bytes(&db_path);
@@ -2254,7 +2253,7 @@ pub fn status(conn: &Connection) -> Result<Value, ApiError> {
     if ok.is_some() && ok_fin > 0 && now - ok_fin > identity::STALE_SOURCE_DAYS * identity::DAY_MS {
         problems.push(format!(
             "The Teams cache hasn't changed since {}. If you've used Teams since then, \
-             it may be storing data somewhere new; check `teams raw stores`.",
+             it may be storing data somewhere new; check `teams debug stores`.",
             iso(Some(ok_fin)).unwrap_or_default()
         ));
     }
@@ -2270,7 +2269,7 @@ pub fn status(conn: &Connection) -> Result<Value, ApiError> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         if scheduled_bks.is_empty() || ok_fin - latest_bk_ms > 2 * identity::DAY_MS {
-            problems.push("No recent backup. Run `teams backup`.".to_string());
+            problems.push("No recent backup. Run `teams archive backup`.".to_string());
         }
     }
     if free < backups::MIN_FREE_BYTES {

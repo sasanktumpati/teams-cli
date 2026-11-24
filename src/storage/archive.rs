@@ -794,6 +794,15 @@ pub fn record_hash(source: &str, data: &Value) -> String {
     hex::encode(&digest[..16])
 }
 
+pub const EPHEMERAL_RECORD_SOURCES: &[&str] = &[
+    "streams-replychain-manager/drafts",
+    "consumption-horizon-manager/consumption-horizon-history",
+];
+
+pub fn is_ephemeral_record_source(source: &str) -> bool {
+    EPHEMERAL_RECORD_SOURCES.contains(&source)
+}
+
 fn keep_version(
     conn: &Connection,
     r: &RawRecord,
@@ -807,6 +816,13 @@ fn keep_version(
         .is_some_and(|s| s.contains(hash))
     {
         return Ok(0);
+    }
+    if is_ephemeral_record_source(&r.source) {
+        conn.prepare_cached("DELETE FROM record_versions WHERE source = ? AND record_key = ?")?
+            .execute(params![r.source, r.key])?;
+        if let Some(key_set) = existing_rv.get_mut(&r.source).and_then(|m| m.get_mut(&r.key)) {
+            key_set.clear();
+        }
     }
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO record_versions (source, record_key, hash, data, captured_at) VALUES (?, ?, ?, ?, ?)",
@@ -824,17 +840,15 @@ fn keep_version(
 fn upsert_person(conn: &Connection, p: &Person, now: i64) -> Result<(), ArchiveError> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO people (mri, name, email, job_title, department, kind, raw, first_seen_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
          ON CONFLICT (mri) DO UPDATE SET
              name       = COALESCE(NULLIF(excluded.name, ''), name),
              email      = COALESCE(NULLIF(excluded.email, ''), email),
              job_title  = COALESCE(NULLIF(excluded.job_title, ''), job_title),
              department = COALESCE(NULLIF(excluded.department, ''), department),
              kind       = COALESCE(NULLIF(excluded.kind, ''), kind),
-             raw        = excluded.raw,
              last_seen_at = excluded.last_seen_at",
     )?;
-    let raw_s = json_codec::to_compact(&p.raw);
     stmt.execute(params![
         p.mri,
         p.name,
@@ -842,7 +856,6 @@ fn upsert_person(conn: &Connection, p: &Person, now: i64) -> Result<(), ArchiveE
         p.job_title,
         p.department,
         p.kind,
-        raw_s,
         now,
         now
     ])?;
@@ -862,7 +875,11 @@ fn upsert_conversation(
         .optional()?
         .is_some();
     let members_s = json_codec::to_compact(&c.members);
-    let raw_s = json_codec::to_compact(&c.raw);
+    let has_raw: i64 = if c.raw.as_object().is_some_and(|m| !m.is_empty()) {
+        1
+    } else {
+        0
+    };
     let fb: i64 = if c.name_is_fallback { 1 } else { 0 };
     if has_read_cols {
         let (horizon, is_read, last_from_me) = extract_conv_read_state(&c.raw);
@@ -870,18 +887,17 @@ fn upsert_conversation(
             "INSERT INTO conversations (
                 id, kind, name, topic, team_id, members, last_message_at, raw,
                 read_horizon, is_read, last_from_me, first_seen_at, last_seen_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
-                kind         = CASE WHEN excluded.raw = '{}' THEN kind ELSE excluded.kind END,
+                kind         = CASE WHEN ? THEN excluded.kind ELSE kind END,
                 name         = CASE WHEN ? AND name IS NOT NULL THEN name ELSE excluded.name END,
                 topic        = COALESCE(NULLIF(excluded.topic, ''), topic),
                 team_id      = COALESCE(excluded.team_id, team_id),
                 members      = CASE WHEN excluded.members = '[]' THEN members ELSE excluded.members END,
                 last_message_at = MAX(COALESCE(excluded.last_message_at, 0), COALESCE(last_message_at, 0)),
-                raw          = CASE WHEN excluded.raw = '{}' THEN raw ELSE excluded.raw END,
-                read_horizon = CASE WHEN excluded.raw = '{}' THEN read_horizon ELSE excluded.read_horizon END,
-                is_read      = CASE WHEN excluded.raw = '{}' THEN is_read ELSE excluded.is_read END,
-                last_from_me = CASE WHEN excluded.raw = '{}' THEN last_from_me ELSE excluded.last_from_me END,
+                read_horizon = CASE WHEN ? THEN excluded.read_horizon ELSE read_horizon END,
+                is_read      = CASE WHEN ? THEN excluded.is_read ELSE is_read END,
+                last_from_me = CASE WHEN ? THEN excluded.last_from_me ELSE last_from_me END,
                 last_seen_at = excluded.last_seen_at",
         )?;
         stmt.execute(params![
@@ -892,15 +908,19 @@ fn upsert_conversation(
             c.team_id,
             members_s,
             c.last_message_at,
-            raw_s,
             horizon,
             is_read,
             last_from_me,
             now,
             now,
-            fb
+            has_raw,
+            fb,
+            has_raw,
+            has_raw,
+            has_raw
         ])?;
     } else {
+        let raw_s = json_codec::to_compact(&c.raw);
         let mut stmt = conn.prepare_cached(
             "INSERT INTO conversations (id, kind, name, topic, team_id, members, last_message_at, raw, first_seen_at, last_seen_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -963,11 +983,9 @@ fn upsert_message(
 
     let existing = conn
         .prepare_cached(&format!(
-            "SELECT {CACHED_MSG_COLS}, raw FROM messages WHERE conversation_id = ? AND message_id = ?"
+            "SELECT {CACHED_MSG_COLS} FROM messages WHERE conversation_id = ? AND message_id = ?"
         ))?
-        .query_row(params![m.conversation_id, m.message_id], |r| {
-            Ok((CachedMsg::from_row(r)?, r.get::<_, Option<String>>(10)?))
-        })
+        .query_row(params![m.conversation_id, m.message_id], CachedMsg::from_row)
         .optional()?;
 
     let text_opt = if m.text.is_empty() { None } else { Some(m.text.as_str()) };
@@ -979,12 +997,11 @@ fn upsert_message(
             } else {
                 None
             };
-            let raw_s = json_codec::to_compact(&m.raw);
             conn.prepare_cached(
                 "INSERT INTO messages (conversation_id, message_id, thread_id, parent_id, version, arrived_at,
                     edited_at, deleted_at, sender_mri, sender_name, message_type, kind, content_html, text,
                     subject, importance, reactions, properties, raw, content_hash, first_seen_at, last_seen_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             )?
             .execute(params![
                 m.conversation_id,
@@ -1005,7 +1022,6 @@ fn upsert_message(
                 m.importance,
                 prep.reactions_json,
                 prep.props_json,
-                raw_s,
                 h,
                 now,
                 now
@@ -1015,7 +1031,7 @@ fn upsert_message(
                 index_message_mentions(conn, &m.conversation_id, &m.message_id, &m.properties)?;
             }
         }
-        Some((cached, old_raw)) => {
+        Some(cached) => {
             if message_unchanged(m, &prep, &cached) {
                 touch_pks.push(cached.pk);
                 return Ok(());
@@ -1046,7 +1062,7 @@ fn upsert_message(
                 }
             }
             if newer {
-                let (merged_props, raw_s) = if !has_content {
+                let merged_props = if !has_content {
                     let mp = merge_json_object(old_props.as_deref(), &m.properties, true);
                     props_json = json_codec::to_compact(&mp);
                     if m.reactions.is_empty() {
@@ -1054,10 +1070,9 @@ fn upsert_message(
                             reactions_json = r.clone();
                         }
                     }
-                    let mr = merge_json_object(old_raw.as_deref(), &m.raw, false);
-                    (mp, json_codec::to_compact(&mr))
+                    mp
                 } else {
-                    (m.properties.clone(), json_codec::to_compact(&m.raw))
+                    m.properties.clone()
                 };
                 let hc: i64 = if has_content { 1 } else { 0 };
                 conn.prepare_cached(
@@ -1069,7 +1084,7 @@ fn upsert_message(
                         message_type = CASE WHEN ? OR content_html IS NULL THEN ? ELSE message_type END,
                         kind = CASE WHEN ? OR content_html IS NULL THEN ? ELSE kind END,
                         importance = COALESCE(NULLIF(?, ''), importance), reactions = ?, properties = ?,
-                        raw = ?, last_seen_at = ?,
+                        last_seen_at = ?,
                         text = CASE WHEN content_html IS NULL AND ? != '' THEN ? ELSE text END
                      WHERE pk = ?",
                 )?
@@ -1089,7 +1104,6 @@ fn upsert_message(
                     m.importance,
                     reactions_json,
                     props_json,
-                    raw_s,
                     now,
                     m.text,
                     m.text,
@@ -1352,6 +1366,18 @@ pub fn finish_run(
         params![now_ms(), status, stats_s, message, run_id],
     )?;
     Ok(())
+}
+
+pub fn prune_old_sync_runs(conn: &Connection, retention_days: i64, keep_min: i64) -> Result<usize, ArchiveError> {
+    let cutoff = now_ms().saturating_sub(retention_days.max(1) * identity::DAY_MS);
+    let keep = keep_min.max(1);
+    let n = conn.execute(
+        "DELETE FROM sync_runs \
+         WHERE status = 'ok' AND started_at < ? \
+           AND id NOT IN (SELECT id FROM sync_runs ORDER BY id DESC LIMIT ?)",
+        params![cutoff, keep],
+    )?;
+    Ok(n)
 }
 
 pub fn last_run(conn: &Connection, ok_only: bool) -> Option<SyncRun> {

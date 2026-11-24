@@ -20,7 +20,6 @@ fn executor_app_schemas_validate_against_daemon() {
     }
 
     let _g = env_lock();
-    std::env::remove_var(daemon::API_TOKEN_ENV);
     let (_td, _home) = home_with_archive();
     let runner: SyncRunner = Arc::new(|_| Ok(json!({"messages_new": 0})));
     let handle = daemon::start(0, Some(SyncConfig { runner, interval: None }), false).unwrap();
