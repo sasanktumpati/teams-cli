@@ -1,21 +1,43 @@
 use crate::launchd;
 use crate::live::http;
+use crate::paths;
 use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 pub const REPO: &str = "sasanktumpati/teams-cli";
 pub const API_BASE: &str = "https://api.github.com";
 pub const MAX_API_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+pub const UPDATE_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+pub const UPDATE_NOTICE_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+pub const NO_UPDATE_CHECK_ENV: &str = "TEAMS_CLI_NO_UPDATE_CHECK";
+const BACKGROUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKGROUND_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 5;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckCache {
+    pub checked_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_notice_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_notice_version: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct UpdateOptions {
@@ -124,7 +146,25 @@ pub fn is_trusted_release_url(raw: &str, allow_loopback_http: bool) -> bool {
 }
 
 fn fetch_bytes(url: &str, accept: Option<&str>, max_bytes: u64, allow_loopback_http: bool) -> Result<Vec<u8>, String> {
-    let agent = http::agent(Duration::from_secs(60));
+    fetch_bytes_with_timeouts(
+        url,
+        accept,
+        max_bytes,
+        allow_loopback_http,
+        http::CONNECT_TIMEOUT,
+        Duration::from_secs(60),
+    )
+}
+
+fn fetch_bytes_with_timeouts(
+    url: &str,
+    accept: Option<&str>,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let agent = http::agent_with_timeouts(connect_timeout, read_timeout);
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         if !is_trusted_release_url(&current, allow_loopback_http) {
@@ -328,6 +368,14 @@ pub fn run_update(opts: &UpdateOptions) -> Result<UpdateOutcome, String> {
     let exe = env::current_exe().map_err(|e| format!("Could not locate current executable: {e}"))?;
     let exe = fs::canonicalize(&exe).unwrap_or(exe);
     let mut outcome = run_update_with(opts, API_BASE, REPO, crate::VERSION, target, &exe, false, true)?;
+    if opts.version.is_none() {
+        let cache_path = paths::update_check_path();
+        let mut cache = load_update_cache(&cache_path).unwrap_or_default();
+        cache.checked_at = now_unix_secs();
+        cache.latest_version = Some(outcome.target_version.clone());
+        cache.tag = Some(outcome.tag.clone());
+        let _ = save_update_cache(&cache_path, &cache);
+    }
     if outcome.updated && launchd::status()["loaded"].as_bool().unwrap_or(false) {
         match launchd::restart() {
             Ok(_) => outcome.daemon_restarted = true,
@@ -335,6 +383,213 @@ pub fn run_update(opts: &UpdateOptions) -> Result<UpdateOutcome, String> {
         }
     }
     Ok(outcome)
+}
+
+fn env_is_truthy(name: &str) -> bool {
+    let Ok(val) = env::var(name) else {
+        return false;
+    };
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !matches!(trimmed.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+}
+
+pub fn update_check_disabled() -> bool {
+    env_is_truthy(NO_UPDATE_CHECK_ENV) || env_is_truthy("CI")
+}
+
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn load_update_cache(path: &Path) -> Option<UpdateCheckCache> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_update_cache(path: &Path, cache: &UpdateCheckCache) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(cache).map_err(|e| format!("Serialize update cache failed: {e}"))?;
+    paths::atomic_write_text(path, &format!("{text}\n")).map_err(|e| format!("Write update cache failed: {e}"))
+}
+
+pub fn is_check_due(cache: Option<&UpdateCheckCache>, now_secs: u64) -> bool {
+    match cache {
+        None => true,
+        Some(c) => now_secs.saturating_sub(c.checked_at) >= UPDATE_CHECK_INTERVAL_SECS,
+    }
+}
+
+pub fn cached_available_update<'a>(cache: &'a UpdateCheckCache, current_version: &str) -> Option<&'a str> {
+    let latest = cache.latest_version.as_deref()?;
+    if is_newer(current_version, latest) {
+        Some(latest)
+    } else {
+        None
+    }
+}
+
+pub fn peek_cached_update() -> Option<String> {
+    if update_check_disabled() {
+        return None;
+    }
+    let cache = load_update_cache(&paths::update_check_path())?;
+    cached_available_update(&cache, crate::VERSION).map(ToOwned::to_owned)
+}
+
+pub fn should_show_notice(cache: &UpdateCheckCache, current_version: &str, now_secs: u64) -> Option<String> {
+    let latest = cached_available_update(cache, current_version)?;
+    if cache.last_notice_version.as_deref() == Some(latest)
+        && cache
+            .last_notice_at
+            .is_some_and(|at| now_secs.saturating_sub(at) < UPDATE_NOTICE_COOLDOWN_SECS)
+    {
+        return None;
+    }
+    Some(latest.to_string())
+}
+
+pub fn take_due_notice(cache_path: &Path, current_version: &str, now_secs: u64) -> Option<String> {
+    let mut cache = load_update_cache(cache_path)?;
+    let latest = should_show_notice(&cache, current_version, now_secs)?;
+    cache.last_notice_at = Some(now_secs);
+    cache.last_notice_version = Some(latest.clone());
+    let _ = save_update_cache(cache_path, &cache);
+    Some(latest)
+}
+
+pub fn format_update_notice(current_version: &str, latest_version: &str, color: bool) -> String {
+    let cur = current_version.trim().trim_start_matches('v');
+    let lat = latest_version.trim().trim_start_matches('v');
+    let plain1 = format!("Update available: v{cur} -> v{lat}");
+    let plain2 = "Run `teams update` to upgrade";
+    let content_w = plain1.chars().count().max(plain2.chars().count());
+    let bar = "─".repeat(content_w + 4);
+    let pad1 = " ".repeat(content_w - plain1.chars().count());
+    let pad2 = " ".repeat(content_w - plain2.chars().count());
+    if color {
+        let dim = "\x1b[2m";
+        let bold = "\x1b[1m";
+        let green = "\x1b[1;32m";
+        let cyan = "\x1b[1;36m";
+        let reset = "\x1b[0m";
+        let line1 = format!("{bold}Update available:{reset} {dim}v{cur} ->{reset} {green}v{lat}{reset}");
+        let line2 = format!("Run `{cyan}teams update{reset}` to upgrade");
+        format!(
+            "{dim}╭{bar}╮{reset}\n\
+             {dim}│{reset}  {line1}{pad1}  {dim}│{reset}\n\
+             {dim}│{reset}  {line2}{pad2}  {dim}│{reset}\n\
+             {dim}╰{bar}╯{reset}"
+        )
+    } else {
+        format!(
+            "╭{bar}╮\n\
+             │  {plain1}{pad1}  │\n\
+             │  {plain2}{pad2}  │\n\
+             ╰{bar}╯"
+        )
+    }
+}
+
+pub fn fetch_latest_release_tag(
+    api_base: &str,
+    repo: &str,
+    allow_loopback_http: bool,
+) -> Result<(String, String), String> {
+    let url = format!("{}/repos/{repo}/releases/latest", api_base.trim_end_matches('/'));
+    let bytes = fetch_bytes_with_timeouts(
+        &url,
+        Some("application/vnd.github+json"),
+        MAX_API_BYTES,
+        allow_loopback_http,
+        BACKGROUND_CONNECT_TIMEOUT,
+        BACKGROUND_READ_TIMEOUT,
+    )?;
+    let release: Value = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid GitHub release JSON: {e}"))?;
+    let tag = release["tag_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "GitHub release response is missing tag_name.".to_string())?
+        .to_string();
+    let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    Ok((tag, version))
+}
+
+pub fn refresh_update_cache_with(
+    api_base: &str,
+    repo: &str,
+    cache_path: &Path,
+    now_secs: u64,
+    allow_loopback_http: bool,
+) -> Result<UpdateCheckCache, String> {
+    let mut cache = load_update_cache(cache_path).unwrap_or_default();
+    cache.checked_at = now_secs;
+    match fetch_latest_release_tag(api_base, repo, allow_loopback_http) {
+        Ok((tag, version)) => {
+            cache.tag = Some(tag);
+            cache.latest_version = Some(version);
+            save_update_cache(cache_path, &cache)?;
+            Ok(cache)
+        }
+        Err(e) => {
+            let _ = save_update_cache(cache_path, &cache);
+            Err(e)
+        }
+    }
+}
+
+pub fn run_background_check() {
+    if update_check_disabled() {
+        return;
+    }
+    let cache_path = paths::update_check_path();
+    let now = now_unix_secs();
+    let _ = refresh_update_cache_with(API_BASE, REPO, &cache_path, now, false);
+}
+
+pub fn spawn_background_check_if_due() -> bool {
+    if update_check_disabled() {
+        return false;
+    }
+    let cache_path = paths::update_check_path();
+    let now = now_unix_secs();
+    let existing = load_update_cache(&cache_path);
+    if !is_check_due(existing.as_ref(), now) {
+        return false;
+    }
+    let mut stamped = existing.unwrap_or_default();
+    stamped.checked_at = now;
+    if save_update_cache(&cache_path, &stamped).is_err() {
+        return false;
+    }
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["update", "--background-check"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.spawn().is_ok()
+}
+
+pub fn maybe_print_update_notice(show_box: bool) {
+    if update_check_disabled() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let cache_path = paths::update_check_path();
+    let now = now_unix_secs();
+    if show_box {
+        if let Some(latest) = take_due_notice(&cache_path, crate::VERSION, now) {
+            let color = env::var_os("NO_COLOR").is_none();
+            eprintln!("\n{}", format_update_notice(crate::VERSION, &latest, color));
+        }
+    }
+    let _ = spawn_background_check_if_due();
 }
 
 #[allow(clippy::too_many_arguments)]

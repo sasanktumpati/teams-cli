@@ -243,3 +243,135 @@ fn mock_github_release_check_install_and_checksum_failure() {
     server.unblock();
     handle.join().unwrap();
 }
+
+#[test]
+fn update_cache_cooldown_and_version_bump() {
+    let td = tempfile::tempdir().unwrap();
+    let cache_path = td.path().join("update-check.json");
+
+    assert!(update::is_check_due(None, 1_000));
+
+    let initial = update::UpdateCheckCache {
+        checked_at: 1_000,
+        latest_version: Some("0.4.0".to_string()),
+        tag: Some("v0.4.0".to_string()),
+        last_notice_at: None,
+        last_notice_version: None,
+    };
+    update::save_update_cache(&cache_path, &initial).unwrap();
+
+    assert!(!update::is_check_due(
+        Some(&initial),
+        1_000 + update::UPDATE_CHECK_INTERVAL_SECS - 1
+    ));
+    assert!(update::is_check_due(
+        Some(&initial),
+        1_000 + update::UPDATE_CHECK_INTERVAL_SECS
+    ));
+
+    assert_eq!(
+        update::take_due_notice(&cache_path, "0.3.1", 2_000).as_deref(),
+        Some("0.4.0")
+    );
+    assert_eq!(update::take_due_notice(&cache_path, "0.3.1", 2_100), None);
+    assert_eq!(
+        update::take_due_notice(&cache_path, "0.3.1", 2_000 + update::UPDATE_NOTICE_COOLDOWN_SECS - 1),
+        None
+    );
+    assert_eq!(
+        update::take_due_notice(&cache_path, "0.3.1", 2_000 + update::UPDATE_NOTICE_COOLDOWN_SECS).as_deref(),
+        Some("0.4.0")
+    );
+    assert_eq!(update::take_due_notice(&cache_path, "0.4.0", 50_000), None);
+    assert_eq!(update::take_due_notice(&cache_path, "0.5.0", 50_000), None);
+
+    let mut bumped = update::load_update_cache(&cache_path).unwrap();
+    bumped.latest_version = Some("0.4.1".to_string());
+    bumped.tag = Some("v0.4.1".to_string());
+    update::save_update_cache(&cache_path, &bumped).unwrap();
+    assert_eq!(
+        update::take_due_notice(&cache_path, "0.3.1", 2_000 + update::UPDATE_NOTICE_COOLDOWN_SECS + 10).as_deref(),
+        Some("0.4.1")
+    );
+}
+
+#[test]
+fn update_notice_box_formatting_aligns_cleanly() {
+    let plain = update::format_update_notice("0.3.1", "0.4.0", false);
+    let lines: Vec<&str> = plain.lines().collect();
+    assert_eq!(lines.len(), 4);
+    let widths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+    assert!(widths.iter().all(|&w| w == widths[0]), "{plain}");
+    assert!(plain.contains("Update available: v0.3.1 -> v0.4.0"));
+    assert!(plain.contains("Run `teams update` to upgrade"));
+    assert!(!plain.contains('\x1b'));
+
+    let colored = update::format_update_notice("v0.3.1", "v1.12.10", true);
+    assert_eq!(colored.lines().count(), 4);
+    assert!(colored.contains('\x1b'));
+    assert!(colored.contains("v0.3.1"));
+    assert!(colored.contains("v1.12.10"));
+    assert!(colored.contains("teams update"));
+}
+
+#[test]
+fn refresh_update_cache_records_release_and_preserves_state_on_error() {
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let addr = server.server_addr().to_ip().unwrap();
+    let base = format!("http://{addr}");
+
+    let srv = server.clone();
+    let handle = thread::spawn(move || {
+        while let Ok(req) = srv.recv() {
+            match req.url() {
+                "/repos/owner/ok/releases/latest" => {
+                    let body = json!({"tag_name": "v0.4.2", "assets": []}).to_string();
+                    let _ = req.respond(Response::from_string(body));
+                }
+                _ => {
+                    let _ = req.respond(Response::empty(500));
+                }
+            }
+        }
+    });
+
+    let td = tempfile::tempdir().unwrap();
+    let cache_path = td.path().join("update-check.json");
+
+    let ok = update::refresh_update_cache_with(&base, "owner/ok", &cache_path, 10_000, true).unwrap();
+    assert_eq!(ok.checked_at, 10_000);
+    assert_eq!(ok.latest_version.as_deref(), Some("0.4.2"));
+    assert_eq!(ok.tag.as_deref(), Some("v0.4.2"));
+
+    assert!(update::refresh_update_cache_with(&base, "owner/fail", &cache_path, 20_000, true).is_err());
+    let after_err = update::load_update_cache(&cache_path).unwrap();
+    assert_eq!(after_err.checked_at, 20_000);
+    assert_eq!(after_err.latest_version.as_deref(), Some("0.4.2"));
+    assert_eq!(after_err.tag.as_deref(), Some("v0.4.2"));
+
+    server.unblock();
+    handle.join().unwrap();
+}
+
+#[test]
+fn update_notice_modes_respect_json_and_machine_commands() {
+    use clap::Parser;
+    use teams_cli::cli::{Cli, UpdateNoticeMode};
+
+    let mode = |args: &[&str]| Cli::parse_from(args).command.update_notice_mode();
+    assert_eq!(mode(&["teams", "inbox"]), UpdateNoticeMode::Full);
+    assert_eq!(mode(&["teams", "inbox", "--json"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "status"]), UpdateNoticeMode::CheckOnly);
+    assert_eq!(mode(&["teams", "status", "--json"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "sync"]), UpdateNoticeMode::Full);
+    assert_eq!(mode(&["teams", "sync", "--notify"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "sync", "--json"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "update", "--check"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "daemon"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "docs"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "token"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "completions", "zsh"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "export", "General"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "agent", "status"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "agent", "logs"]), UpdateNoticeMode::Full);
+}

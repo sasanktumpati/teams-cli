@@ -26,7 +26,7 @@ teams agent install
 teams doctor
 ```
 
-Update anytime with `teams update` (`teams update --check` to check without installing). Prebuilt binaries and `SHA256SUMS.txt` are on [GitHub Releases](https://github.com/sasanktumpati/teams-cli/releases); verify provenance with `gh attestation verify teams-*.tar.gz -R sasanktumpati/teams-cli`.
+Update anytime with `teams update` (`teams update --check` to check without installing). Interactive commands check GitHub releases at most once every 24 hours and show a notice when a newer version is available (set `TEAMS_CLI_NO_UPDATE_CHECK=1` to disable). Prebuilt binaries and `SHA256SUMS.txt` are on [GitHub Releases](https://github.com/sasanktumpati/teams-cli/releases); verify provenance with `gh attestation verify teams-*.tar.gz -R sasanktumpati/teams-cli`.
 
 On first run, allow macOS to access `~/Library/Containers/com.microsoft.teams2/`.
 

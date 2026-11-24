@@ -79,6 +79,10 @@ pub fn lock_path() -> PathBuf {
     home().join("sync.lock")
 }
 
+pub fn update_check_path() -> PathBuf {
+    home().join("update-check.json")
+}
+
 pub fn backups_dir() -> PathBuf {
     ensure_private_dir_once(home().join("backups"))
 }

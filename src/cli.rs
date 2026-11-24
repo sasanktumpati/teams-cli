@@ -567,7 +567,74 @@ pub enum Commands {
         force: bool,
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, hide = true)]
+        background_check: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateNoticeMode {
+    None,
+    CheckOnly,
+    Full,
+}
+
+impl Commands {
+    pub fn update_notice_mode(&self) -> UpdateNoticeMode {
+        match self {
+            Commands::Docs
+            | Commands::Daemon { .. }
+            | Commands::Completions { .. }
+            | Commands::Raw { .. }
+            | Commands::Token { .. }
+            | Commands::Export { .. }
+            | Commands::Update { .. }
+            | Commands::Agent {
+                action: AgentAction::Status,
+            } => UpdateNoticeMode::None,
+            Commands::Sync { json, notify, .. } => {
+                if *json || *notify {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::Full
+                }
+            }
+            Commands::Status { json } => {
+                if *json {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::CheckOnly
+                }
+            }
+            Commands::Doctor { json }
+            | Commands::Migrations { json }
+            | Commands::Chats { json, .. }
+            | Commands::Messages { json, .. }
+            | Commands::Changes { json, .. }
+            | Commands::Records { json, .. }
+            | Commands::Search { json, .. }
+            | Commands::Attachments { json, .. }
+            | Commands::Fetch { json, .. }
+            | Commands::Send { json, .. }
+            | Commands::People { json, .. }
+            | Commands::Person { json, .. }
+            | Commands::Inbox { json, .. }
+            | Commands::Mentions { json, .. }
+            | Commands::Calls { json, .. }
+            | Commands::Meetings { json, .. }
+            | Commands::Saved { json, .. }
+            | Commands::Pinned { json, .. }
+            | Commands::Verify { json, .. }
+            | Commands::Restore { json, .. } => {
+                if *json {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::Full
+                }
+            }
+            Commands::Backup { .. } | Commands::Reindex | Commands::Agent { .. } => UpdateNoticeMode::Full,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -792,6 +859,9 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 s["backups"]["count"],
                 s["backups"]["latest"].as_str().unwrap_or("none")
             );
+            if let Some(latest) = update::peek_cached_update() {
+                println!("Update    v{latest} available - run `teams update`");
+            }
             if let Some(probs) = s["problems"].as_array() {
                 for p in probs {
                     if let Some(ps) = p.as_str() {
@@ -2079,7 +2149,12 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             target_version,
             force,
             json,
+            background_check,
         } => {
+            if background_check {
+                update::run_background_check();
+                return Ok(0);
+            }
             let opts = update::UpdateOptions {
                 check_only: check,
                 version: target_version,
