@@ -15,6 +15,7 @@ pub mod paths;
 pub mod query;
 pub mod storage;
 pub mod timeutil;
+pub mod update;
 
 #[cfg(test)]
 mod tests;

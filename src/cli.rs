@@ -9,6 +9,7 @@ use crate::paths;
 use crate::query::{api, export, views};
 use crate::storage::{archive, backups, migrations};
 use crate::timeutil::{iso, short};
+use crate::update;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -550,6 +551,22 @@ pub enum Commands {
     Completions {
         #[arg(value_enum, help = "Target shell")]
         shell: clap_complete::Shell,
+    },
+
+    #[command(about = "Check for or install the latest teams-cli release from GitHub")]
+    Update {
+        #[arg(long, help = "Check if a newer release is available without installing")]
+        check: bool,
+        #[arg(
+            long = "version",
+            value_name = "TAG",
+            help = "Install a specific release tag (e.g. v0.3.0)"
+        )]
+        target_version: Option<String>,
+        #[arg(long, help = "Reinstall even if already on the latest version")]
+        force: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
 }
 
@@ -2055,6 +2072,42 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "teams", &mut std::io::stdout());
+            Ok(0)
+        }
+        Commands::Update {
+            check,
+            target_version,
+            force,
+            json,
+        } => {
+            let opts = update::UpdateOptions {
+                check_only: check,
+                version: target_version,
+                force,
+            };
+            let outcome = update::run_update(&opts).map_err(CliError::Runtime)?;
+            if json {
+                fmt::print_json(&outcome.to_json());
+            } else if outcome.updated {
+                println!(
+                    "Updated teams v{} -> v{} ({})",
+                    outcome.current_version, outcome.target_version, outcome.binary_path
+                );
+                if outcome.daemon_restarted {
+                    println!("Daemon restarted.");
+                }
+            } else if outcome.update_available {
+                println!(
+                    "Update available: v{} -> v{} (run `teams update` to install)",
+                    outcome.current_version, outcome.target_version
+                );
+            } else {
+                println!("teams is already up to date (v{}).", outcome.current_version);
+            }
+            if let Some(ref err) = outcome.daemon_restart_error {
+                eprintln!("teams: daemon restart failed ({err}); run `teams agent restart`");
+                return Ok(1);
+            }
             Ok(0)
         }
     }

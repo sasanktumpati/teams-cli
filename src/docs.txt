@@ -69,3 +69,4 @@ Commands
   teams agent install [--interval SEC=60] [--port PORT] | uninstall | restart | status | logs [--lines N=50]
   teams raw stores | dump DB STORE
   teams completions bash|zsh|fish|elvish|powershell
+  teams update [--check] [--version TAG] [--force] [--json]
