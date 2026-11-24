@@ -2199,9 +2199,12 @@ pub fn status(conn: &Connection) -> Result<Value, ApiError> {
     let last = archive::last_run(conn, false);
     let ok = archive::last_run(conn, true);
     let preserved = if let Some(ref ok_r) = ok {
+        let cutoff = archive::get_meta(conn, "last_full_sync_started_at")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(ok_r.started_at);
         conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE kind = 'message' AND last_seen_at < ?",
-            [ok_r.started_at],
+            [cutoff],
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)

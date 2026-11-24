@@ -4,7 +4,7 @@ use crate::ingest::SourceError;
 use crate::paths;
 use regex::Regex;
 use serde_json::{Number, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -224,6 +224,16 @@ fn keep_newest<K: std::hash::Hash + Eq, T>(map: &mut HashMap<K, Best<T>>, key: K
     }
 }
 
+pub enum IncrementalOpen {
+    Ready(Box<TeamsCache>),
+    NeedsFullSync(&'static str),
+}
+
+enum BlinkError {
+    MissingBlob,
+    Other,
+}
+
 pub struct TeamsCache {
     _tmp: tempfile::TempDir,
     blob_dir: Option<PathBuf>,
@@ -231,7 +241,9 @@ pub struct TeamsCache {
     store_ids: HashMap<u64, HashMap<String, u64>>,
     store_records: HashMap<(u64, u64), Vec<RawRecord>>,
     blob_lookup: HashMap<(u64, u64, Vec<u8>, u64), BlobInfo>,
+    max_seq: u64,
     pub bad_records: usize,
+    pub missing_blob: bool,
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path, skip_lock: bool) -> std::io::Result<()> {
@@ -239,7 +251,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path, skip_lock: bool) -> std::io::Resul
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
-        if skip_lock && name == "LOCK" {
+        if skip_lock && (name == "LOCK" || name == "LOG" || name == "LOG.old") {
             continue;
         }
         let sp = entry.path();
@@ -252,6 +264,63 @@ fn copy_dir_recursive(src: &Path, dst: &Path, skip_lock: bool) -> std::io::Resul
         }
     }
     Ok(())
+}
+
+fn find_database_in(db_ids: &HashMap<String, u64>, manager: &str) -> Option<String> {
+    let pfx = format!("Teams:{manager}:");
+    let mut candidates: Vec<&String> = db_ids.keys().filter(|n| n.starts_with(&pfx)).collect();
+    candidates.sort();
+    if let Some(pref) = candidates.iter().find(|n| n.contains(":react-web-client:")) {
+        return Some((*pref).clone());
+    }
+    candidates.first().map(|s| (*s).clone())
+}
+
+fn resolve_keyed_db_in(
+    db_ids: &HashMap<String, u64>,
+    store_ids: &HashMap<u64, HashMap<String, u64>>,
+    manager: &str,
+    store: &str,
+) -> Option<(u64, u64)> {
+    let pfx = format!("Teams:{manager}:");
+    let mut names: Vec<&String> = db_ids.keys().filter(|n| n.starts_with(&pfx) || *n == manager).collect();
+    names.sort_by(|a, b| {
+        let a_pref = !a.contains(":react-web-client:");
+        let b_pref = !b.contains(":react-web-client:");
+        a_pref.cmp(&b_pref).then_with(|| a.cmp(b))
+    });
+    for name in names {
+        if let Some(&db_id) = db_ids.get(name) {
+            if let Some(&store_id) = store_ids.get(&db_id).and_then(|m| m.get(store)) {
+                return Some((db_id, store_id));
+            }
+        }
+    }
+    None
+}
+
+fn wanted_store_pairs(
+    db_ids: &HashMap<String, u64>,
+    store_ids: &HashMap<u64, HashMap<String, u64>>,
+    direct: &[(&str, &str)],
+    keyed: &[(&str, &str)],
+) -> HashSet<(u64, u64)> {
+    let mut keep = HashSet::new();
+    for &(manager, store) in direct {
+        if let Some(db_name) = find_database_in(db_ids, manager) {
+            if let Some(&db_id) = db_ids.get(&db_name) {
+                if let Some(&store_id) = store_ids.get(&db_id).and_then(|m| m.get(store)) {
+                    keep.insert((db_id, store_id));
+                }
+            }
+        }
+    }
+    for &(manager, store) in keyed {
+        if let Some(pair) = resolve_keyed_db_in(db_ids, store_ids, manager, store) {
+            keep.insert(pair);
+        }
+    }
+    keep
 }
 
 impl TeamsCache {
@@ -293,8 +362,12 @@ impl TeamsCache {
         let mut os_name_best: HashMap<(u64, u64), Best<Vec<u8>>> = HashMap::new();
         let mut store_records: HashMap<(u64, u64), Vec<RawRecord>> = HashMap::new();
         let mut blob_best: HashMap<BlobKey, Best<Vec<BlobInfo>>> = HashMap::new();
+        let mut max_seq = 0u64;
 
         leveldb::for_each_record(&ldb_copy, |k, val, seq, state| {
+            if seq > max_seq {
+                max_seq = seq;
+            }
             if k.len() >= 5 && k[0..4] == [0, 0, 0, 0] && k[4] == 0xc9 {
                 keep_newest(&mut db_meta_best, k.to_vec(), seq, state, val.to_vec());
                 return;
@@ -339,7 +412,126 @@ impl TeamsCache {
             os_name_best,
             store_records,
             blob_best,
+            max_seq,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_incremental<F>(
+        source_dir: &Path,
+        changed_files: &[(u64, bool, PathBuf)],
+        known_db_ids: &BTreeMap<String, u64>,
+        known_store_ids: &BTreeMap<u64, BTreeMap<String, u64>>,
+        since_seq: u64,
+        direct_stores: &[(&str, &str)],
+        keyed_stores: &[(&str, &str)],
+        on_copied: F,
+    ) -> Result<IncrementalOpen, SourceError>
+    where
+        F: FnOnce() -> Result<(), SourceError>,
+    {
+        let blob = source_dir.join(format!("{}.blob", paths::ORIGIN));
+        let tmp = tempfile::Builder::new()
+            .prefix("teams-cli-")
+            .tempdir()
+            .map_err(|e| SourceError(format!("failed creating tempdir: {e}")))?;
+        let _ = fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700));
+
+        let mut copied_files = Vec::with_capacity(changed_files.len());
+        for (no, is_log, src_path) in changed_files {
+            let Some(fname) = src_path.file_name() else {
+                continue;
+            };
+            let dst = tmp.path().join(fname);
+            fs::copy(src_path, &dst).map_err(|e| SourceError(format!("copying LevelDB delta failed: {e}")))?;
+            copied_files.push((*no, *is_log, dst));
+        }
+
+        on_copied()?;
+
+        let db_ids: HashMap<String, u64> = known_db_ids.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        let store_ids: HashMap<u64, HashMap<String, u64>> = known_store_ids
+            .iter()
+            .map(|(&db_id, m)| (db_id, m.iter().map(|(k, &v)| (k.clone(), v)).collect()))
+            .collect();
+        let wanted = wanted_store_pairs(&db_ids, &store_ids, direct_stores, keyed_stores);
+
+        let mut store_records: HashMap<(u64, u64), Vec<RawRecord>> = HashMap::new();
+        let mut blob_best: HashMap<BlobKey, Best<Vec<BlobInfo>>> = HashMap::new();
+        let mut max_seq = 0u64;
+        let mut meta_changed = false;
+
+        leveldb::for_each_record_in_files(&copied_files, |k, val, seq, state| {
+            if seq > max_seq {
+                max_seq = seq;
+            }
+            if k.len() >= 5 && k[0..4] == [0, 0, 0, 0] && k[4] == 0xc9 {
+                if seq > since_seq {
+                    meta_changed = true;
+                }
+                return;
+            }
+            let Some((db_id, store_id, index_id, pfx_len)) = read_prefix(k) else {
+                return;
+            };
+            let suffix = &k[pfx_len..];
+            if store_id == 0 && index_id == 0 {
+                if seq > since_seq && !suffix.is_empty() && suffix[0] == 50 {
+                    let mut p = 1usize;
+                    if read_varint(suffix, &mut p).is_some() && p < suffix.len() && suffix[p] == 0 {
+                        meta_changed = true;
+                    }
+                }
+            } else if db_id > 0 && store_id > 0 && index_id == 1 {
+                if seq > since_seq && state != KeyState::Deleted && wanted.contains(&(db_id, store_id)) {
+                    store_records.entry((db_id, store_id)).or_default().push(RawRecord {
+                        key: suffix.to_vec(),
+                        value: val.to_vec(),
+                        seq,
+                        state,
+                    });
+                }
+            } else if db_id > 0 && store_id > 0 && index_id == 3 && wanted.contains(&(db_id, store_id)) {
+                let infos = if state == KeyState::Deleted {
+                    Vec::new()
+                } else {
+                    parse_blob_infos(val)
+                };
+                keep_newest(&mut blob_best, (db_id, store_id, suffix.to_vec()), seq, state, infos);
+            }
+        });
+
+        if meta_changed {
+            return Ok(IncrementalOpen::NeedsFullSync("metadata_changed"));
+        }
+        if max_seq > 0 && max_seq < since_seq {
+            return Ok(IncrementalOpen::NeedsFullSync("seq_reset"));
+        }
+
+        for entries in store_records.values_mut() {
+            entries.sort_by_key(|r| r.seq);
+        }
+        let mut blob_lookup: HashMap<(u64, u64, Vec<u8>, u64), BlobInfo> = HashMap::new();
+        for ((db_id, store_id, suffix), best) in blob_best {
+            if best.state == KeyState::Deleted {
+                continue;
+            }
+            for (idx, info) in best.value.into_iter().enumerate() {
+                blob_lookup.insert((db_id, store_id, suffix.clone(), idx as u64), info);
+            }
+        }
+
+        Ok(IncrementalOpen::Ready(Box::new(Self {
+            _tmp: tmp,
+            blob_dir: blob.is_dir().then_some(blob),
+            db_ids,
+            store_ids,
+            store_records,
+            blob_lookup,
+            max_seq: max_seq.max(since_seq),
+            bad_records: 0,
+            missing_blob: false,
+        })))
     }
 
     fn finish_index(
@@ -349,6 +541,7 @@ impl TeamsCache {
         os_name_best: HashMap<(u64, u64), Best<Vec<u8>>>,
         mut store_records: HashMap<(u64, u64), Vec<RawRecord>>,
         blob_best: HashMap<BlobKey, Best<Vec<BlobInfo>>>,
+        max_seq: u64,
     ) -> Self {
         for entries in store_records.values_mut() {
             entries.sort_by_key(|r| r.seq);
@@ -418,8 +611,29 @@ impl TeamsCache {
             store_ids,
             store_records,
             blob_lookup,
+            max_seq,
             bad_records: 0,
+            missing_blob: false,
         }
+    }
+
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
+    }
+
+    pub fn has_records(&self) -> bool {
+        self.store_records.values().any(|v| !v.is_empty())
+    }
+
+    pub fn db_ids_snapshot(&self) -> BTreeMap<String, u64> {
+        self.db_ids.iter().map(|(k, &v)| (k.clone(), v)).collect()
+    }
+
+    pub fn store_ids_snapshot(&self) -> BTreeMap<u64, BTreeMap<String, u64>> {
+        self.store_ids
+            .iter()
+            .map(|(&db_id, m)| (db_id, m.iter().map(|(k, &v)| (k.clone(), v)).collect()))
+            .collect()
     }
 
     pub fn database_names(&self) -> Vec<String> {
@@ -441,13 +655,7 @@ impl TeamsCache {
     }
 
     pub fn find_database(&self, manager: &str) -> Option<String> {
-        let pfx = format!("Teams:{manager}:");
-        let mut candidates: Vec<&String> = self.db_ids.keys().filter(|n| n.starts_with(&pfx)).collect();
-        candidates.sort();
-        if let Some(pref) = candidates.iter().find(|n| n.contains(":react-web-client:")) {
-            return Some((*pref).clone());
-        }
-        candidates.first().map(|s| (*s).clone())
+        find_database_in(&self.db_ids, manager)
     }
 
     pub fn user_object_id(&self) -> Option<String> {
@@ -468,7 +676,7 @@ impl TeamsCache {
         store_id: u64,
         raw_key: &[u8],
         buf: &[u8],
-    ) -> Result<Value, String> {
+    ) -> Result<Value, BlinkError> {
         self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, buf, 0)
     }
 
@@ -480,55 +688,53 @@ impl TeamsCache {
         raw_key: &[u8],
         buf: &[u8],
         depth: usize,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, BlinkError> {
         if depth >= MAX_DEPTH {
-            return Err("Blink wrapper nesting depth exceeded".to_string());
+            return Err(BlinkError::Other);
         }
         if buf.is_empty() {
             return Ok(Value::Null);
         }
         let mut pos = 0usize;
         if buf[pos] != 0xFF {
-            return Err("missing Blink 0xFF tag".to_string());
+            return Err(BlinkError::Other);
         }
         pos += 1;
-        let blink_ver = read_varint(buf, &mut pos).ok_or("truncated Blink version")?;
+        let blink_ver = read_varint(buf, &mut pos).ok_or(BlinkError::Other)?;
         if blink_ver == 0x11 {
             if pos >= buf.len() {
-                return Err("truncated Blink 0x11 wrapper".to_string());
+                return Err(BlinkError::Other);
             }
             let wrap_tag = buf[pos];
             pos += 1;
             if wrap_tag == 0x01 {
-                let _size = read_varint(buf, &mut pos).ok_or("truncated blob size")?;
-                let blob_idx = read_varint(buf, &mut pos).ok_or("truncated blob index")?;
+                let _size = read_varint(buf, &mut pos).ok_or(BlinkError::Other)?;
+                let blob_idx = read_varint(buf, &mut pos).ok_or(BlinkError::Other)?;
                 let info = self
                     .blob_lookup
                     .get(&(db_id, store_id, raw_key.to_vec(), blob_idx))
-                    .ok_or("missing external blob info")?;
-                let blob_root = self.blob_dir.as_ref().ok_or("blob dir not present")?;
+                    .ok_or(BlinkError::MissingBlob)?;
+                let blob_root = self.blob_dir.as_ref().ok_or(BlinkError::MissingBlob)?;
                 let path = blob_root
                     .join(format!("{db_id:x}"))
                     .join(format!("{:02x}", info.blob_number >> 8))
                     .join(format!("{:x}", info.blob_number));
-                let blob_bytes = fs::read(&path).map_err(|e| format!("reading blob {}: {e}", path.display()))?;
+                let blob_bytes = fs::read(&path).map_err(|_| BlinkError::MissingBlob)?;
                 return self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, &blob_bytes, depth + 1);
             } else if wrap_tag == 0x02 {
-                let decompressed = decoder
-                    .decompress_vec(&buf[pos..])
-                    .map_err(|e| format!("snappy blink decompress: {e}"))?;
+                let decompressed = decoder.decompress_vec(&buf[pos..]).map_err(|_| BlinkError::Other)?;
                 return self.decode_blink_value_depth(decoder, db_id, store_id, raw_key, &decompressed, depth + 1);
             } else {
-                return Err(format!("unknown Blink wrapper tag 0x{wrap_tag:02x}"));
+                return Err(BlinkError::Other);
             }
         }
         if blink_ver >= BLINK_MIN_TRAILER_VERSION {
             if pos + BLINK_TRAILER_SIZE > buf.len() || buf[pos] != BLINK_TRAILER_TAG {
-                return Err("invalid Blink trailer".to_string());
+                return Err(BlinkError::Other);
             }
             pos += BLINK_TRAILER_SIZE;
         }
-        Deserializer::deserialize(&buf[pos..])
+        Deserializer::deserialize(&buf[pos..]).map_err(|_| BlinkError::Other)
     }
 
     fn decode_entries(
@@ -537,9 +743,10 @@ impl TeamsCache {
         store_id: u64,
         entries: &[RawRecord],
         mut cb: impl FnMut(Value, Value),
-    ) -> usize {
+    ) -> (usize, bool) {
         let mut decoder = snap::raw::Decoder::new();
         let mut bad = 0usize;
+        let mut missing_blob = false;
         for rec in entries {
             if rec.state == KeyState::Deleted {
                 continue;
@@ -560,50 +767,22 @@ impl TeamsCache {
             }
             match self.decode_blink_value(&mut decoder, db_id, store_id, &idb_key.raw_key, &raw_val[pos..]) {
                 Ok(v) => cb(idb_key.value, v),
-                Err(_) => bad += 1,
+                Err(BlinkError::MissingBlob) => {
+                    bad += 1;
+                    missing_blob = true;
+                }
+                Err(BlinkError::Other) => bad += 1,
             }
         }
-        bad
+        (bad, missing_blob)
     }
 
     fn resolve_keyed_db(&self, manager: &str, store: &str) -> Option<(u64, u64)> {
-        let pfx = format!("Teams:{manager}:");
-        let mut names: Vec<&String> = self
-            .db_ids
-            .keys()
-            .filter(|n| n.starts_with(&pfx) || *n == manager)
-            .collect();
-        names.sort_by(|a, b| {
-            let a_pref = !a.contains(":react-web-client:");
-            let b_pref = !b.contains(":react-web-client:");
-            a_pref.cmp(&b_pref).then_with(|| a.cmp(b))
-        });
-        for name in names {
-            if let Some(&db_id) = self.db_ids.get(name) {
-                if let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) {
-                    return Some((db_id, store_id));
-                }
-            }
-        }
-        None
+        resolve_keyed_db_in(&self.db_ids, &self.store_ids, manager, store)
     }
 
     pub fn retain_wanted_stores(&mut self, direct: &[(&str, &str)], keyed: &[(&str, &str)]) {
-        let mut keep = std::collections::HashSet::new();
-        for &(manager, store) in direct {
-            if let Some(db_name) = self.find_database(manager) {
-                if let Some(&db_id) = self.db_ids.get(&db_name) {
-                    if let Some(&store_id) = self.store_ids.get(&db_id).and_then(|m| m.get(store)) {
-                        keep.insert((db_id, store_id));
-                    }
-                }
-            }
-        }
-        for &(manager, store) in keyed {
-            if let Some(pair) = self.resolve_keyed_db(manager, store) {
-                keep.insert(pair);
-            }
-        }
+        let keep = wanted_store_pairs(&self.db_ids, &self.store_ids, direct, keyed);
         self.store_records.retain(|pair, _| keep.contains(pair));
         self.blob_lookup
             .retain(|(db_id, store_id, _, _), _| keep.contains(&(*db_id, *store_id)));
@@ -622,8 +801,9 @@ impl TeamsCache {
         let Some(entries) = self.store_records.remove(&(db_id, store_id)) else {
             return;
         };
-        let bad = self.decode_entries(db_id, store_id, &entries, |_, v| cb(v));
+        let (bad, missing_blob) = self.decode_entries(db_id, store_id, &entries, |_, v| cb(v));
         self.bad_records += bad;
+        self.missing_blob |= missing_blob;
     }
 
     pub fn for_each_taken_keyed_record(&mut self, manager: &str, store: &str, cb: impl FnMut(Value, Value)) {
@@ -633,8 +813,9 @@ impl TeamsCache {
         let Some(entries) = self.store_records.remove(&(db_id, store_id)) else {
             return;
         };
-        let bad = self.decode_entries(db_id, store_id, &entries, cb);
+        let (bad, missing_blob) = self.decode_entries(db_id, store_id, &entries, cb);
         self.bad_records += bad;
+        self.missing_blob |= missing_blob;
     }
 
     pub fn raw_records_with_keys(&mut self, db_name: &str, store: &str) -> Vec<(Value, Value)> {
@@ -648,8 +829,9 @@ impl TeamsCache {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(entries.len());
-        let bad = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
+        let (bad, missing_blob) = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
         self.bad_records += bad;
+        self.missing_blob |= missing_blob;
         out
     }
 
@@ -671,8 +853,9 @@ impl TeamsCache {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(entries.len());
-        let bad = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
+        let (bad, missing_blob) = self.decode_entries(db_id, store_id, entries, |k, v| out.push((k, v)));
         self.bad_records += bad;
+        self.missing_blob |= missing_blob;
         out
     }
 }

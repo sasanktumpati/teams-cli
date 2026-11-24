@@ -1,11 +1,14 @@
 use crate::identity;
 use crate::ingest::extract::{self, Snapshot};
-use crate::ingest::indexeddb::TeamsCache;
+use crate::ingest::indexeddb::{IncrementalOpen, TeamsCache};
+use crate::ingest::leveldb;
 use crate::ingest::{SourceError, SyncBusy};
 use crate::paths;
 use crate::storage::{archive, backups, db};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -16,6 +19,33 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const NOTIFY_AFTER_HOURS: f64 = 6.0;
 pub const STALE_SOURCE_DAYS: i64 = identity::STALE_SOURCE_DAYS;
 pub const STALE_NOTIFY_HOURS: f64 = 24.0;
+pub const FULL_SYNC_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+pub const FULL_SYNC_ENV: &str = "TEAMS_CLI_FULL_SYNC";
+const INCREMENTAL_STATE_META_KEY: &str = "incremental_state";
+const FULL_SYNC_STARTED_META_KEY: &str = "last_full_sync_started_at";
+
+fn full_sync_forced_by_env() -> bool {
+    let Ok(v) = std::env::var(FULL_SYNC_ENV) else {
+        return false;
+    };
+    let t = v.trim();
+    !t.is_empty() && !matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IncrementalState {
+    schema_version: i64,
+    render_version: i64,
+    source: String,
+    full_sync_at_ms: i64,
+    last_seq: u64,
+    me_mri: Option<String>,
+    db_ids: BTreeMap<String, u64>,
+    store_ids: BTreeMap<u64, BTreeMap<String, u64>>,
+    files: BTreeMap<String, (u64, i128)>,
+    cache_messages: i64,
+}
 
 pub struct SyncLockGuard {
     _file: File,
@@ -75,7 +105,7 @@ pub fn source_fingerprint(source: &Path) -> String {
         let mut files = Vec::new();
         walk_sorted(&d, &mut files);
         for p in files {
-            if p.file_name().and_then(|n| n.to_str()) == Some("LOCK") {
+            if matches!(p.file_name().and_then(|n| n.to_str()), Some("LOCK" | "LOG" | "LOG.old")) {
                 continue;
             }
             let rel = p.strip_prefix(source).unwrap_or(&p).to_string_lossy();
@@ -203,18 +233,60 @@ fn drift_warning(prev: Option<&archive::SyncRun>, stats: &Map<String, Value>) ->
     None
 }
 
+fn file_len_and_mtime(path: &Path) -> Option<(u64, i128)> {
+    let st = fs::metadata(path).ok()?;
+    if !st.is_file() {
+        return None;
+    }
+    let mtime_ns = st.mtime_nsec() as i128 + (st.mtime() as i128) * 1_000_000_000;
+    Some((st.len(), mtime_ns))
+}
+
+type FileMetaMap = BTreeMap<String, (u64, i128)>;
+type DataFileList = Vec<(u64, bool, PathBuf)>;
+
+fn leveldb_data_files_meta(source: &Path) -> Result<(FileMetaMap, DataFileList), String> {
+    let ldb = source.join(format!("{}.leveldb", paths::ORIGIN));
+    let listed = leveldb::list_data_files(&ldb)?;
+    let mut meta = BTreeMap::new();
+    for (_, _, p) in &listed {
+        if let (Some(name), Some(sig)) = (p.file_name().and_then(|n| n.to_str()), file_len_and_mtime(p)) {
+            meta.insert(name.to_string(), sig);
+        }
+    }
+    Ok((meta, listed))
+}
+
+fn load_incremental_state(conn: &rusqlite::Connection) -> Option<IncrementalState> {
+    let raw = archive::get_meta(conn, INCREMENTAL_STATE_META_KEY)?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_incremental_state(conn: &rusqlite::Connection, state: &IncrementalState) -> Result<(), String> {
+    let text = serde_json::to_string(state).map_err(|e| e.to_string())?;
+    archive::set_meta(conn, INCREMENTAL_STATE_META_KEY, &text).map_err(|e| e.to_string())
+}
+
+struct FullSyncOutput {
+    applied: archive::ApplyCacheResult,
+    used_fp: String,
+    inc_state: IncrementalState,
+}
+
 fn sync_snapshot_into_archive(
     conn: &rusqlite::Connection,
     source: &Path,
+    full_sync_at_ms: i64,
     attempts: usize,
     wait_secs: u64,
-) -> Result<(archive::ApplyCacheResult, String), String> {
+) -> Result<FullSyncOutput, String> {
     let attempts = attempts.max(1);
     for attempt in 1..=attempts {
         if let Some(e) = cache_missing_error(source) {
             return Err(e.to_string());
         }
         let before = source_fingerprint(source);
+        let files_meta = leveldb_data_files_meta(source).map(|(m, _)| m).unwrap_or_default();
         let check = || -> Result<(), SourceError> {
             if source_fingerprint(source) != before {
                 return Err(SourceError(format!(
@@ -224,23 +296,51 @@ fn sync_snapshot_into_archive(
             Ok(())
         };
         match TeamsCache::open(Some(source), Some(check)) {
-            Ok(mut cache) => match archive::apply_cache(conn, &mut cache, None) {
-                Ok(res) => return Ok((res, before)),
-                Err(archive::ApplyCacheError::Archive(e)) => return Err(e.to_string()),
-                Err(archive::ApplyCacheError::Source(e)) => {
-                    if let Some(missing) = cache_missing_error(source) {
-                        return Err(missing.to_string());
+            Ok(mut cache) => {
+                let max_seq = cache.max_seq();
+                let me_mri = cache.user_object_id().map(|o| format!("8:orgid:{o}"));
+                let db_ids = cache.db_ids_snapshot();
+                let store_ids = cache.store_ids_snapshot();
+                match archive::apply_cache(conn, &mut cache, None) {
+                    Ok(applied) => {
+                        let cache_messages = applied.cache_stats.get("cache_messages").copied().unwrap_or(0);
+                        let inc_state = IncrementalState {
+                            schema_version: archive::SCHEMA_VERSION,
+                            render_version: extract::RENDER_VERSION,
+                            source: source.to_string_lossy().into_owned(),
+                            full_sync_at_ms,
+                            last_seq: max_seq,
+                            me_mri,
+                            db_ids,
+                            store_ids,
+                            files: files_meta,
+                            cache_messages,
+                        };
+                        return Ok(FullSyncOutput {
+                            applied,
+                            used_fp: before,
+                            inc_state,
+                        });
                     }
-                    if attempt == attempts {
-                        return Err(format!(
-                            "Could not take a consistent snapshot of the Teams cache after {attempts} attempts: {}",
-                            e.0
-                        ));
+                    Err(archive::ApplyCacheError::Archive(e)) => return Err(e.to_string()),
+                    Err(archive::ApplyCacheError::MissingBlob) => {
+                        return Err("Unexpected missing blob during full sync".to_string());
                     }
-                    let backoff = wait_secs.saturating_mul(1u64 << (attempt - 1).min(16));
-                    thread::sleep(Duration::from_secs(backoff));
+                    Err(archive::ApplyCacheError::Source(e)) => {
+                        if let Some(missing) = cache_missing_error(source) {
+                            return Err(missing.to_string());
+                        }
+                        if attempt == attempts {
+                            return Err(format!(
+                                "Could not take a consistent snapshot of the Teams cache after {attempts} attempts: {}",
+                                e.0
+                            ));
+                        }
+                        let backoff = wait_secs.saturating_mul(1u64 << (attempt - 1).min(16));
+                        thread::sleep(Duration::from_secs(backoff));
+                    }
                 }
-            },
+            }
             Err(e) => {
                 if let Some(missing) = cache_missing_error(source) {
                     return Err(missing.to_string());
@@ -257,6 +357,129 @@ fn sync_snapshot_into_archive(
         }
     }
     Err("Failed to snapshot Teams cache".to_string())
+}
+
+enum IncrementalOutcome {
+    NoChanges {
+        used_fp: String,
+        next_state: IncrementalState,
+    },
+    Applied {
+        applied: archive::ApplyCacheResult,
+        used_fp: String,
+        next_state: IncrementalState,
+    },
+    FallbackToFull,
+}
+
+fn try_incremental_sync(
+    conn: &rusqlite::Connection,
+    source: &Path,
+    state: &IncrementalState,
+) -> Result<IncrementalOutcome, String> {
+    if state.last_seq == 0 {
+        return Ok(IncrementalOutcome::FallbackToFull);
+    }
+    for attempt in 1..=2usize {
+        if cache_missing_error(source).is_some() {
+            return Ok(IncrementalOutcome::FallbackToFull);
+        }
+        let before = source_fingerprint(source);
+        let Ok((cur_files, listed)) = leveldb_data_files_meta(source) else {
+            return Ok(IncrementalOutcome::FallbackToFull);
+        };
+        let changed: Vec<(u64, bool, PathBuf)> = listed
+            .into_iter()
+            .filter(|(_, _, p)| {
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    return false;
+                };
+                match (cur_files.get(name), state.files.get(name)) {
+                    (Some(cur), Some(prev)) => cur != prev,
+                    (Some(_), None) => true,
+                    _ => false,
+                }
+            })
+            .collect();
+
+        if changed.is_empty() {
+            if source_fingerprint(source) != before {
+                if attempt == 2 {
+                    return Ok(IncrementalOutcome::FallbackToFull);
+                }
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let mut next_state = state.clone();
+            next_state.files = cur_files;
+            return Ok(IncrementalOutcome::NoChanges {
+                used_fp: before,
+                next_state,
+            });
+        }
+
+        let check = || -> Result<(), SourceError> {
+            if source_fingerprint(source) != before {
+                return Err(SourceError("Teams wrote to its cache during delta copy".to_string()));
+            }
+            Ok(())
+        };
+
+        let opened = TeamsCache::open_incremental(
+            source,
+            &changed,
+            &state.db_ids,
+            &state.store_ids,
+            state.last_seq,
+            extract::CORE_STORES,
+            extract::EXTRA_STORES,
+            check,
+        );
+
+        let mut cache = match opened {
+            Ok(IncrementalOpen::Ready(c)) => *c,
+            Ok(IncrementalOpen::NeedsFullSync(_)) => return Ok(IncrementalOutcome::FallbackToFull),
+            Err(_) => {
+                if attempt == 2 {
+                    return Ok(IncrementalOutcome::FallbackToFull);
+                }
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        let mut next_state = state.clone();
+        next_state.files = cur_files;
+        next_state.last_seq = cache.max_seq().max(state.last_seq);
+
+        if !cache.has_records() {
+            return Ok(IncrementalOutcome::NoChanges {
+                used_fp: before,
+                next_state,
+            });
+        }
+
+        let seed = archive::load_extract_seed(conn, state.me_mri.clone()).map_err(|e| e.to_string())?;
+        match archive::apply_cache_incremental(conn, &mut cache, seed, None) {
+            Ok(applied) => {
+                return Ok(IncrementalOutcome::Applied {
+                    applied,
+                    used_fp: before,
+                    next_state,
+                });
+            }
+            Err(archive::ApplyCacheError::MissingBlob) => {
+                return Ok(IncrementalOutcome::FallbackToFull);
+            }
+            Err(archive::ApplyCacheError::Archive(e)) => return Err(e.to_string()),
+            Err(archive::ApplyCacheError::Source(_)) => return Ok(IncrementalOutcome::FallbackToFull),
+        }
+    }
+    Ok(IncrementalOutcome::FallbackToFull)
+}
+
+fn has_meaningful_delta(merged: &BTreeMap<String, i64>) -> bool {
+    merged.values().any(|&v| v > 0)
 }
 
 pub fn run_sync(source: Option<&Path>, notify: bool, force: bool) -> Result<Value, String> {
@@ -287,17 +510,94 @@ pub fn run_sync(source: Option<&Path>, notify: bool, force: bool) -> Result<Valu
         return Ok(Value::Object(stats));
     }
 
-    let run_id = archive::start_run(&conn, &src.to_string_lossy()).map_err(|e| e.to_string())?;
+    let now_before = archive::now_ms();
+    let src_str = src.to_string_lossy().into_owned();
+    let can_try_incremental = !force
+        && !full_sync_forced_by_env()
+        && prev.is_some()
+        && load_incremental_state(&conn)
+            .filter(|st| {
+                st.schema_version == archive::SCHEMA_VERSION
+                    && st.render_version == extract::RENDER_VERSION
+                    && st.source == src_str
+                    && now_before.saturating_sub(st.full_sync_at_ms) < FULL_SYNC_INTERVAL_MS
+            })
+            .is_some();
+
+    if can_try_incremental {
+        if let Some(inc_state) = load_incremental_state(&conn) {
+            let t0 = Instant::now();
+            match try_incremental_sync(&conn, &src, &inc_state) {
+                Ok(IncrementalOutcome::NoChanges { used_fp, next_state }) => {
+                    save_incremental_state(&conn, &next_state)?;
+                    archive::set_meta(&conn, "source_fingerprint", &used_fp).map_err(|e| e.to_string())?;
+                    archive::set_meta(&conn, "last_checked_at", &archive::now_ms().to_string())
+                        .map_err(|e| e.to_string())?;
+                    let _ = db::wal_checkpoint(&conn, "TRUNCATE");
+                    let mut stats = Map::new();
+                    stats.insert(
+                        "skipped".to_string(),
+                        Value::String("No new Teams records in cache delta".to_string()),
+                    );
+                    stats.insert("incremental".to_string(), json!(true));
+                    stats.insert("duration_ms".to_string(), json!(t0.elapsed().as_millis() as i64));
+                    maybe_backup(&conn, &mut stats, notify);
+                    if notify {
+                        notify_if_cache_stale(&conn);
+                    }
+                    return Ok(Value::Object(stats));
+                }
+                Ok(IncrementalOutcome::Applied {
+                    applied,
+                    used_fp,
+                    next_state,
+                }) => {
+                    save_incremental_state(&conn, &next_state)?;
+                    archive::set_meta(&conn, "source_fingerprint", &used_fp).map_err(|e| e.to_string())?;
+                    archive::set_meta(&conn, "last_checked_at", &archive::now_ms().to_string())
+                        .map_err(|e| e.to_string())?;
+                    let mut stats = Map::new();
+                    if has_meaningful_delta(&applied.merged) {
+                        let run_id = archive::start_run(&conn, &src_str).map_err(|e| e.to_string())?;
+                        for (k, v) in applied.merged {
+                            stats.insert(k, json!(v));
+                        }
+                        stats.insert("cache_messages".to_string(), json!(next_state.cache_messages));
+                        stats.insert("incremental".to_string(), json!(true));
+                        stats.insert("duration_ms".to_string(), json!(t0.elapsed().as_millis() as i64));
+                        let stats_val = Value::Object(stats.clone());
+                        archive::finish_run(&conn, run_id, "ok", Some(&stats_val), None).map_err(|e| e.to_string())?;
+                    } else {
+                        stats.insert(
+                            "skipped".to_string(),
+                            Value::String("No new Teams records in cache delta".to_string()),
+                        );
+                        stats.insert("incremental".to_string(), json!(true));
+                        stats.insert("duration_ms".to_string(), json!(t0.elapsed().as_millis() as i64));
+                    }
+                    let _ = db::wal_checkpoint(&conn, "TRUNCATE");
+                    maybe_backup(&conn, &mut stats, notify);
+                    if notify {
+                        notify_if_cache_stale(&conn);
+                    }
+                    return Ok(Value::Object(stats));
+                }
+                Ok(IncrementalOutcome::FallbackToFull) | Err(_) => {}
+            }
+        }
+    }
+
+    let full_started_at = archive::now_ms();
+    let run_id = archive::start_run(&conn, &src_str).map_err(|e| e.to_string())?;
     let t0 = Instant::now();
     let res = (|| -> Result<Map<String, Value>, String> {
-        let (applied, used_fp) = sync_snapshot_into_archive(&conn, &src, 4, 3)?;
+        let out = sync_snapshot_into_archive(&conn, &src, full_started_at, 4, 3)?;
         db::optimize(&conn);
-        let _ = db::wal_checkpoint(&conn, "TRUNCATE");
         let mut stats = Map::new();
-        for (k, v) in applied.merged {
+        for (k, v) in out.applied.merged {
             stats.insert(k, json!(v));
         }
-        for (k, v) in applied.cache_stats {
+        for (k, v) in out.applied.cache_stats {
             stats.insert(k, json!(v));
         }
         if let Ok(n) = archive::rerender(&conn, false) {
@@ -311,8 +611,12 @@ pub fn run_sync(source: Option<&Path>, notify: bool, force: bool) -> Result<Valu
         let stats_val = Value::Object(stats.clone());
         archive::finish_run(&conn, run_id, status_str, Some(&stats_val), warning.as_deref())
             .map_err(|e| e.to_string())?;
-        archive::set_meta(&conn, "source_fingerprint", &used_fp).map_err(|e| e.to_string())?;
+        save_incremental_state(&conn, &out.inc_state)?;
+        archive::set_meta(&conn, FULL_SYNC_STARTED_META_KEY, &full_started_at.to_string())
+            .map_err(|e| e.to_string())?;
+        archive::set_meta(&conn, "source_fingerprint", &out.used_fp).map_err(|e| e.to_string())?;
         archive::set_meta(&conn, "last_checked_at", &archive::now_ms().to_string()).map_err(|e| e.to_string())?;
+        let _ = db::wal_checkpoint(&conn, "TRUNCATE");
         Ok(stats)
     })();
 

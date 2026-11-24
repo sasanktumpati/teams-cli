@@ -1,7 +1,7 @@
 use crate::identity;
 use crate::ingest::extract::{
-    self, render_text, volatile_fields, Conversation, ExtractError, ExtractSink, Message, Person, RawRecord, Snapshot,
-    RENDER_VERSION,
+    self, render_text, volatile_fields, Conversation, ExtractError, ExtractSeed, ExtractSink, Message, Person,
+    RawRecord, Snapshot, RENDER_VERSION,
 };
 use crate::ingest::indexeddb::TeamsCache;
 use crate::ingest::SourceError;
@@ -517,6 +517,7 @@ pub struct ApplyCacheResult {
 pub enum ApplyCacheError {
     Source(SourceError),
     Archive(ArchiveError),
+    MissingBlob,
 }
 
 struct StreamingApplier<'a> {
@@ -618,11 +619,74 @@ impl ExtractSink for StreamingApplier<'_> {
     }
 }
 
+pub fn load_extract_seed(conn: &Connection, me_mri: Option<String>) -> Result<ExtractSeed, ArchiveError> {
+    let mut by_mri = HashMap::new();
+    let mut by_oid = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT mri, name FROM people WHERE name IS NOT NULL AND name != ''")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (mri, name) = row?;
+            let o = identity::oid(&mri);
+            if !o.is_empty() {
+                by_oid.insert(o, name.clone());
+            }
+            by_mri.insert(mri, name);
+        }
+    }
+    let mut seen_convs = HashSet::new();
+    let mut team_names = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, kind, name FROM conversations")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })? {
+            let (id, kind, name) = row?;
+            if kind == "team" {
+                if let Some(n) = name.filter(|s| !s.is_empty()) {
+                    team_names.insert(id.clone(), n);
+                }
+            }
+            seen_convs.insert(id);
+        }
+    }
+    Ok(ExtractSeed {
+        incremental: true,
+        me_mri,
+        by_mri,
+        by_oid,
+        seen_convs,
+        team_names,
+    })
+}
+
 pub fn apply_cache(
     conn: &Connection,
     cache: &mut TeamsCache,
     now_override: Option<i64>,
 ) -> Result<ApplyCacheResult, ApplyCacheError> {
+    apply_cache_with_seed(conn, cache, ExtractSeed::default(), now_override)
+}
+
+pub fn apply_cache_incremental(
+    conn: &Connection,
+    cache: &mut TeamsCache,
+    seed: ExtractSeed,
+    now_override: Option<i64>,
+) -> Result<ApplyCacheResult, ApplyCacheError> {
+    apply_cache_with_seed(conn, cache, seed, now_override)
+}
+
+fn apply_cache_with_seed(
+    conn: &Connection,
+    cache: &mut TeamsCache,
+    seed: ExtractSeed,
+    now_override: Option<i64>,
+) -> Result<ApplyCacheResult, ApplyCacheError> {
+    let incremental = seed.incremental;
     let now = now_override.unwrap_or_else(now_ms);
     let (has_member_table, has_mention_table, has_read_cols) =
         schema_capabilities(conn).map_err(ApplyCacheError::Archive)?;
@@ -645,11 +709,17 @@ pub fn apply_cache(
         rv_hashes: Vec::with_capacity(db::LOOKUP_CHUNK),
     };
 
-    let res = match extract::extract_into(cache, &mut applier) {
-        Ok(cache_stats) => applier
-            .finish()
-            .map(|merged| ApplyCacheResult { merged, cache_stats })
-            .map_err(ApplyCacheError::Archive),
+    let res = match extract::extract_into_with_seed(cache, &mut applier, seed) {
+        Ok(cache_stats) => {
+            if incremental && (cache.missing_blob || cache.bad_records > 0) {
+                Err(ApplyCacheError::MissingBlob)
+            } else {
+                applier
+                    .finish()
+                    .map(|merged| ApplyCacheResult { merged, cache_stats })
+                    .map_err(ApplyCacheError::Archive)
+            }
+        }
         Err(ExtractError::Source(e)) => Err(ApplyCacheError::Source(e)),
         Err(ExtractError::Sink(e)) => Err(ApplyCacheError::Archive(e)),
     };

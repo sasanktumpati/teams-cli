@@ -305,7 +305,7 @@ fn scan_log_file(path: &Path, cb: &mut impl FnMut(&[u8], &[u8], u64, KeyState)) 
     }
 }
 
-pub fn for_each_record(dir: &Path, mut cb: impl FnMut(&[u8], &[u8], u64, KeyState)) -> Result<(), String> {
+pub fn list_data_files(dir: &Path) -> Result<Vec<(u64, bool, PathBuf)>, String> {
     if !dir.is_dir() {
         return Err(format!("LevelDB directory not found: {}", dir.display()));
     }
@@ -335,15 +335,23 @@ pub fn for_each_record(dir: &Path, mut cb: impl FnMut(&[u8], &[u8], u64, KeyStat
         }
     }
     files.sort_by_key(|(no, _, _)| *no);
+    Ok(files)
+}
 
+pub fn for_each_record_in_files(files: &[(u64, bool, PathBuf)], mut cb: impl FnMut(&[u8], &[u8], u64, KeyState)) {
     let mut decoder = snap::raw::Decoder::new();
     for (_, is_log, path) in files {
-        if is_log {
-            scan_log_file(&path, &mut cb);
+        if *is_log {
+            scan_log_file(path, &mut cb);
         } else {
-            scan_ldb_file(&path, &mut decoder, &mut cb);
+            scan_ldb_file(path, &mut decoder, &mut cb);
         }
     }
+}
+
+pub fn for_each_record(dir: &Path, cb: impl FnMut(&[u8], &[u8], u64, KeyState)) -> Result<(), String> {
+    let files = list_data_files(dir)?;
+    for_each_record_in_files(&files, cb);
     Ok(())
 }
 

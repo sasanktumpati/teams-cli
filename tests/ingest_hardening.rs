@@ -807,3 +807,123 @@ fn links_and_mentions_are_scoped_to_their_blockquote_frame() {
     );
     assert_eq!(html_to_text(html, &mentions), "@Ada Lovelace");
 }
+
+#[test]
+fn incremental_sync_applies_delta_skips_noise_and_falls_back_on_meta() {
+    const GROUP: &str = "19:delta-room@thread.v2";
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("TEAMS_CLI_HOME", home.path());
+
+    let src = source();
+    let rdb = db_name("replychain-manager");
+    let pdb = db_name("profiles");
+    let cdb = db_name("conversation-manager");
+    let noise_db = db_name("telemetry-noise");
+    write_leveldb_log(
+        &src.ldb.join("000002.log"),
+        &[
+            db_meta(&pdb, 1, 1),
+            store_name(1, 1, "profiles", 2),
+            record(1, 1, ADA, &json!({"mri": ADA, "displayName": "Ada Lovelace"}), 3),
+            db_meta(&cdb, 2, 4),
+            store_name(2, 1, "conversations", 5),
+            record(
+                2,
+                1,
+                GROUP,
+                &json!({"id": GROUP, "type": "Chat", "threadProperties": {"topic": "Delta Room"}}),
+                6,
+            ),
+            db_meta(&rdb, 3, 7),
+            store_name(3, 1, "replychains-2", 8),
+            record(
+                3,
+                1,
+                "rc1",
+                &json!({
+                    "conversationId": GROUP,
+                    "messageMap": {
+                        "1": {
+                            "id": "1",
+                            "conversationId": GROUP,
+                            "content": "<p>first message</p>",
+                            "messageType": "RichText/Html",
+                            "creator": ADA,
+                            "version": 100,
+                            "originalArrivalTime": 1_700_000_001_000i64
+                        }
+                    }
+                }),
+                9,
+            ),
+            db_meta(&noise_db, 4, 10),
+            store_name(4, 1, "events", 11),
+        ],
+    );
+
+    let full = sync::run_sync(Some(&src.root), false, false).unwrap();
+    assert!(full.get("incremental").is_none(), "{full}");
+    assert_eq!(full["messages_new"], 1);
+
+    write_leveldb_log(
+        &src.ldb.join("000003.log"),
+        &[record(
+            3,
+            1,
+            "rc2",
+            &json!({
+                "conversationId": GROUP,
+                "messageMap": {
+                    "2": {
+                        "id": "2",
+                        "conversationId": GROUP,
+                        "content": "<p>second delta message</p>",
+                        "messageType": "RichText/Html",
+                        "creator": ADA,
+                        "version": 200,
+                        "originalArrivalTime": 1_700_000_002_000i64
+                    }
+                }
+            }),
+            20,
+        )],
+    );
+
+    let inc = sync::run_sync(Some(&src.root), false, false).unwrap();
+    assert_eq!(inc["incremental"], true, "{inc}");
+    assert_eq!(inc["messages_new"], 1, "{inc}");
+
+    let conn = teams_cli::storage::archive::connect_readonly(None).unwrap();
+    let status = teams_cli::query::api::status(&conn).unwrap();
+    assert_eq!(status["counts"]["messages"], 2);
+    assert_eq!(status["counts"]["preservedAfterTeamsDropped"], 0);
+    let sender: String = conn
+        .query_row("SELECT sender_name FROM messages WHERE message_id = '2'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sender, "Ada Lovelace");
+    drop(conn);
+
+    write_leveldb_log(
+        &src.ldb.join("000004.log"),
+        &[record(4, 1, "n1", &json!({"ping": true}), 30)],
+    );
+    let noise = sync::run_sync(Some(&src.root), false, false).unwrap();
+    assert_eq!(noise["incremental"], true, "{noise}");
+    assert!(noise.get("skipped").is_some(), "{noise}");
+
+    write_leveldb_log(&src.ldb.join("000005.log"), &[store_name(4, 2, "more-events", 40)]);
+    let fallback = sync::run_sync(Some(&src.root), false, false).unwrap();
+    assert!(fallback.get("incremental").is_none(), "{fallback}");
+
+    write_leveldb_log(
+        &src.ldb.join("000006.log"),
+        &[(data_key(3, 1, "bad-rec"), vec![1, 0x00, 0x00], 50, true)],
+    );
+    let bad_fallback = sync::run_sync(Some(&src.root), false, false).unwrap();
+    assert!(bad_fallback.get("incremental").is_none(), "{bad_fallback}");
+
+    let forced = sync::run_sync(Some(&src.root), false, true).unwrap();
+    assert!(forced.get("incremental").is_none(), "{forced}");
+}

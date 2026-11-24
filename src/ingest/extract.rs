@@ -14,6 +14,13 @@ static AMS_IMG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"<img[^>]+itemtype="http://schema\.skype\.com/AMSImage"[^>]*>"#).unwrap());
 static SRC_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"src="([^"]+)""#).unwrap());
 
+pub const CORE_STORES: &[(&str, &str)] = &[
+    ("profiles", "profiles"),
+    ("replychain-manager", "replychains-2"),
+    ("replychain-manager", "replychains"),
+    ("conversation-manager", "conversations"),
+];
+
 pub const EXTRA_STORES: &[(&str, &str)] = &[
     ("call-history-manager", "call-history"),
     ("calendar", "calendar"),
@@ -530,26 +537,38 @@ pub fn extract(cache: &mut TeamsCache) -> Result<Snapshot, SourceError> {
     })
 }
 
+#[derive(Default)]
+pub struct ExtractSeed {
+    pub incremental: bool,
+    pub me_mri: Option<String>,
+    pub by_mri: HashMap<String, String>,
+    pub by_oid: HashMap<String, String>,
+    pub seen_convs: HashSet<String>,
+    pub team_names: HashMap<String, String>,
+}
+
 pub fn extract_into<S: ExtractSink>(
     cache: &mut TeamsCache,
     sink: &mut S,
 ) -> Result<BTreeMap<String, i64>, ExtractError<S::Error>> {
-    const CORE_STORES: &[(&str, &str)] = &[
-        ("profiles", "profiles"),
-        ("replychain-manager", "replychains-2"),
-        ("replychain-manager", "replychains"),
-        ("conversation-manager", "conversations"),
-    ];
+    extract_into_with_seed(cache, sink, ExtractSeed::default())
+}
+
+pub fn extract_into_with_seed<S: ExtractSink>(
+    cache: &mut TeamsCache,
+    sink: &mut S,
+    seed: ExtractSeed,
+) -> Result<BTreeMap<String, i64>, ExtractError<S::Error>> {
     cache.retain_wanted_stores(CORE_STORES, EXTRA_STORES);
 
-    let me_mri = cache.user_object_id().map(|o| format!("8:orgid:{o}"));
+    let me_mri = cache.user_object_id().map(|o| format!("8:orgid:{o}")).or(seed.me_mri);
     if let Some(ref me) = me_mri {
         sink.on_me(me).map_err(ExtractError::Sink)?;
     }
     let has_replychain_db = cache.find_database("replychain-manager").is_some();
 
-    let mut by_oid: HashMap<String, String> = HashMap::new();
-    let mut by_mri: HashMap<String, String> = HashMap::new();
+    let mut by_oid: HashMap<String, String> = seed.by_oid;
+    let mut by_mri: HashMap<String, String> = seed.by_mri;
     let mut seen_people: HashSet<String> = HashSet::new();
     let mut sink_err: Option<S::Error> = None;
 
@@ -658,17 +677,19 @@ pub fn extract_into<S: ExtractSink>(
         return Err(ExtractError::Sink(e));
     }
 
-    let team_names: HashMap<String, String> = conv_raw
-        .iter()
-        .filter_map(|(cid, tv)| {
-            let ttp = tv.get("threadProperties").and_then(|v| v.as_object())?;
+    let mut team_names: HashMap<String, String> = seed.team_names;
+    for (cid, tv) in &conv_raw {
+        if let Some(ttp) = tv.get("threadProperties").and_then(|v| v.as_object()) {
             let s = get_str(ttp, "spaceThreadTopic");
             let name = if !s.is_empty() { s } else { get_str(ttp, "topic") };
-            (!name.is_empty()).then(|| (cid.clone(), name))
-        })
-        .collect();
+            if !name.is_empty() {
+                team_names.insert(cid.clone(), name);
+            }
+        }
+    }
 
-    let mut seen_convs: HashSet<String> = HashSet::with_capacity(conv_raw.len());
+    let mut seen_convs: HashSet<String> = seed.seen_convs;
+    seen_convs.reserve(conv_raw.len());
     for (cid, c) in conv_raw {
         let (kind, topic, team_id, members, last_message_at) = {
             let co = c.as_object().unwrap();
@@ -930,7 +951,7 @@ pub fn extract_into<S: ExtractSink>(
     }
     drop(seen_msgs);
 
-    if !has_replychain_db || unique_msgs.is_empty() {
+    if !seed.incremental && (!has_replychain_db || unique_msgs.is_empty()) {
         return Err(ExtractError::Source(SourceError(
             "No messages found in the Teams cache. Teams may have changed its storage format; \
              run `teams raw stores` to inspect it."
