@@ -1,3 +1,4 @@
+use crate::completions;
 use crate::daemon;
 use crate::doctor;
 use crate::formatters::{self as fmt, Quoted};
@@ -344,7 +345,11 @@ pub enum Commands {
         events: bool,
         #[arg(long, help = "Include earlier versions under edited messages")]
         history: bool,
-        #[arg(long, help = "Write Markdown to this file (mode 0600) instead of stdout")]
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            help = "Write Markdown to this file (mode 0600) instead of stdout"
+        )]
         out: Option<String>,
     },
 
@@ -356,7 +361,11 @@ pub enum Commands {
         message: Option<String>,
         #[arg(long, help = "1-based attachment index when a message or query has multiple matches")]
         index: Option<usize>,
-        #[arg(long, help = "Destination file or directory path")]
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::AnyPath,
+            help = "Destination file or directory path"
+        )]
         out: Option<String>,
         #[arg(long, help = "Download from Microsoft even if a local OneDrive copy exists")]
         force_download: bool,
@@ -394,7 +403,11 @@ pub enum Commands {
 
     #[command(about = "Copy new messages from the Teams cache into the archive")]
     Sync {
-        #[arg(long, help = "Override the Teams IndexedDB directory path")]
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::DirPath,
+            help = "Override the Teams IndexedDB directory path"
+        )]
         source: Option<String>,
         #[arg(long, help = "Re-read the Teams cache even if its file fingerprint is unchanged")]
         force: bool,
@@ -472,6 +485,14 @@ pub enum Commands {
 
     #[command(about = "Everything on one page: commands, flags, JSON shapes (for agents and scripts)")]
     Docs,
+
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        #[arg(long, default_value = "fish")]
+        shell: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +506,7 @@ impl Commands {
     pub fn update_notice_mode(&self) -> UpdateNoticeMode {
         match self {
             Commands::Docs
+            | Commands::Complete { .. }
             | Commands::Completions { .. }
             | Commands::Debug { .. }
             | Commands::Token { .. }
@@ -642,13 +664,17 @@ pub enum ArchiveAction {
     Backup {
         #[arg(
             long,
+            value_hint = clap::ValueHint::FilePath,
             help = "Destination path (`.sqlite3` or `.sqlite3.xz`); omit for scheduled backup directory"
         )]
         out: Option<String>,
     },
     #[command(about = "Replace the archive with a verified backup (dry run unless --yes)")]
     Restore {
-        #[arg(help = "Path to the `.sqlite3` or `.sqlite3.xz` backup file")]
+        #[arg(
+            value_hint = clap::ValueHint::FilePath,
+            help = "Path to the `.sqlite3` or `.sqlite3.xz` backup file"
+        )]
         backup: String,
         #[arg(long, help = "Perform the restore (omit for dry-run verification)")]
         yes: bool,
@@ -662,7 +688,10 @@ pub enum ArchiveAction {
     },
     #[command(about = "Prove the archive (or one backup FILE) reads end to end; exit 1 if not")]
     Verify {
-        #[arg(help = "Specific `.sqlite3` or `.sqlite3.xz` backup file to verify")]
+        #[arg(
+            value_hint = clap::ValueHint::FilePath,
+            help = "Specific `.sqlite3` or `.sqlite3.xz` backup file to verify"
+        )]
         file: Option<String>,
         #[arg(long, help = "Skip verifying files in the backups directory")]
         no_backups: bool,
@@ -754,6 +783,11 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
         Commands::Docs => {
             print!("{}", docs_text());
+            Ok(0)
+        }
+        Commands::Complete { shell, words } => {
+            let cmd = Cli::command();
+            completions::print_complete(&cmd, &words, &shell);
             Ok(0)
         }
         Commands::Sync {
@@ -2089,8 +2123,7 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             }
         },
         Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "teams", &mut std::io::stdout());
+            print!("{}", completions::generate_script(shell));
             Ok(0)
         }
         Commands::Update {

@@ -375,6 +375,10 @@ fn update_notice_modes_respect_json_and_machine_commands() {
     assert_eq!(mode(&["teams", "archive", "verify", "--json"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "debug", "stores"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "docs"]), UpdateNoticeMode::None);
+    assert_eq!(
+        mode(&["teams", "__complete", "--shell", "fish", "--", "messages", ""]),
+        UpdateNoticeMode::None
+    );
     assert_eq!(mode(&["teams", "token", "list"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "token", "create", "ci"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "completions", "zsh"]), UpdateNoticeMode::None);

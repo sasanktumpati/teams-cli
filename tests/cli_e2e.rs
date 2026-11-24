@@ -59,7 +59,7 @@ fn docs_lists_every_command_and_flag() {
     let cmd = teams_cli::cli::Cli::command();
     for sub in cmd.get_subcommands() {
         let name = sub.get_name();
-        if name == "docs" || name == "help" {
+        if name == "docs" || name == "help" || sub.is_hide_set() {
             continue;
         }
         assert!(
@@ -432,4 +432,89 @@ fn completions_migrations_doctor_and_interval_validation() {
     let bad = teams(&h, &["daemon", "run", "--interval", "5"]);
     assert_eq!(bad.code, 2, "{}", bad.err);
     assert!(bad.err.contains("at least 10"), "{}", bad.err);
+}
+
+#[test]
+fn dynamic_completions_work_across_all_shells() {
+    let (_td, h) = home();
+    for (shell, marker) in [
+        ("fish", "teams __complete --shell fish"),
+        ("zsh", "teams __complete --shell zsh"),
+        ("bash", "teams __complete --shell bash"),
+        ("elvish", "teams __complete --shell elvish"),
+        ("powershell", "teams __complete --shell powershell"),
+    ] {
+        let o = teams(&h, &["completions", shell]);
+        assert_eq!(o.code, 0, "{shell}: {}", o.err);
+        assert!(o.out.contains(marker), "{shell}: {}", o.out);
+    }
+
+    let root = teams(&h, &["__complete", "--shell", "fish", "--", ""]);
+    assert_eq!(root.code, 0);
+    assert!(root.out.contains("inbox\t"));
+    assert!(root.out.contains("daemon\t"));
+    assert!(!root.out.contains("__complete"));
+    assert!(root.out.trim_end().ends_with(":nofiles"));
+
+    let daemon_sub = teams(&h, &["__complete", "--shell", "zsh", "--", "daemon", ""]);
+    assert!(daemon_sub.out.contains("install\t") && daemon_sub.out.contains("logs\t"));
+
+    let flags = teams(&h, &["__complete", "--shell", "fish", "--", "update", "--"]);
+    assert!(flags.out.contains("--check\t"));
+    assert!(!flags.out.contains("--background-check"));
+
+    let chats = teams(&h, &["__complete", "--shell", "fish", "--", "messages", ""]);
+    assert!(chats.out.contains("Launch crew\tchat,"), "{}", chats.out);
+    assert!(chats.out.trim_end().ends_with(":nofiles"));
+
+    let chats_bash = teams(&h, &["__complete", "--shell", "bash", "--", "search", "--chat=Lau"]);
+    assert!(chats_bash.out.contains("--chat=Launch crew\n"), "{}", chats_bash.out);
+    assert!(!chats_bash.out.contains('\t'), "bash omits descriptions");
+
+    let people = teams(&h, &["__complete", "--shell", "zsh", "--", "people", ""]);
+    assert!(people.out.contains("Ada Lovelace\tada@corp.test"), "{}", people.out);
+
+    let sources = teams(&h, &["__complete", "--shell", "fish", "--", "debug", "records", ""]);
+    assert!(
+        sources.out.contains("call-history-manager/call-history\t"),
+        "{}",
+        sources.out
+    );
+
+    let times = teams(&h, &["__complete", "--shell", "fish", "--", "inbox", "--since", ""]);
+    assert!(times.out.contains("today\t") && times.out.contains("7d\t"));
+
+    let expires = teams(
+        &h,
+        &[
+            "__complete",
+            "--shell",
+            "fish",
+            "--",
+            "token",
+            "create",
+            "ci",
+            "--expires",
+            "",
+        ],
+    );
+    assert!(expires.out.contains("30d\t") && expires.out.contains("never\t"));
+
+    let kinds = teams(&h, &["__complete", "--shell", "fish", "--", "chats", "--kind", ""]);
+    assert!(kinds.out.contains("channel") && kinds.out.contains("meeting"));
+
+    let out_flag = teams(
+        &h,
+        &["__complete", "--shell", "fish", "--", "export", "Launch", "--out", ""],
+    );
+    assert!(out_flag.out.trim_end().ends_with(":files"));
+
+    let src_flag = teams(&h, &["__complete", "--shell", "fish", "--", "sync", "--source", ""]);
+    assert!(src_flag.out.trim_end().ends_with(":dirs"));
+
+    let restore = teams(&h, &["__complete", "--shell", "fish", "--", "archive", "restore", ""]);
+    assert!(restore.out.trim_end().ends_with(":files"));
+
+    let status_pos = teams(&h, &["__complete", "--shell", "fish", "--", "status", ""]);
+    assert_eq!(status_pos.out.trim(), ":nofiles");
 }

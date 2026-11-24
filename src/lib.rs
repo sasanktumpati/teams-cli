@@ -3,6 +3,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cli;
+pub mod completions;
 pub mod daemon;
 pub mod doctor;
 pub mod formatters;
