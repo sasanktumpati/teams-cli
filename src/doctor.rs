@@ -363,6 +363,22 @@ pub fn run_diagnostics() -> Value {
         }
     }
 
+    let cookie_db = crate::live::cookies::cookies_path();
+    checks.push(if cookie_db.is_file() {
+        CheckResult::pass(
+            "live_cookies",
+            format!("Teams cookie store present at {}", cookie_db.display()),
+        )
+    } else {
+        CheckResult::pass(
+            "live_cookies",
+            format!(
+                "not present at {} (archive reads still work offline)",
+                cookie_db.display()
+            ),
+        )
+    });
+
     let ok = checks.iter().all(|c| c.ok);
     json!({
         "ok": ok,

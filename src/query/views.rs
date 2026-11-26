@@ -4,6 +4,7 @@ use crate::query::api::{self, ApiError};
 use crate::storage::{archive, db};
 use crate::timeutil::{iso, to_ms};
 use rusqlite::{params_from_iter, types::Value as SqlVal, Connection};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -22,10 +23,13 @@ const PREVIEW_CHARS: usize = 300;
 
 type LatestRecord = (String, String, Value);
 
-fn latest(conn: &Connection, sources: &[&str]) -> Result<Vec<LatestRecord>, ApiError> {
-    let mut out = Vec::new();
+fn for_each_latest_typed<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    sources: &[&str],
+    mut f: impl FnMut(&str, &str, T),
+) -> Result<(), ApiError> {
     if sources.is_empty() {
-        return Ok(out);
+        return Ok(());
     }
     let marks = vec!["?"; sources.len()].join(",");
     let sql = format!(
@@ -35,13 +39,26 @@ fn latest(conn: &Connection, sources: &[&str]) -> Result<Vec<LatestRecord>, ApiE
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params_from_iter(sources.iter().copied()))?;
+    let mut scratch = Vec::with_capacity(16 * 1024);
     while let Some(r) = rows.next()? {
         let src: String = r.get(0)?;
         let rk: String = r.get(1)?;
-        if let Ok(val) = archive::decode_record_ref(r.get_ref(2)?) {
-            out.push((src, rk, val));
+        if let Ok(val) = archive::decode_record_ref_into::<T>(r.get_ref(2)?, &mut scratch) {
+            f(&src, &rk, val);
         }
     }
+    Ok(())
+}
+
+fn for_each_latest(conn: &Connection, sources: &[&str], mut f: impl FnMut(&str, &str, Value)) -> Result<(), ApiError> {
+    for_each_latest_typed::<Value>(conn, sources, |src, rk, val| f(src, rk, val))
+}
+
+fn latest(conn: &Connection, sources: &[&str]) -> Result<Vec<LatestRecord>, ApiError> {
+    let mut out = Vec::new();
+    for_each_latest(conn, sources, |src, rk, val| {
+        out.push((src.to_string(), rk.to_string(), val));
+    })?;
     Ok(out)
 }
 
@@ -245,6 +262,107 @@ fn page_items(mut items: Vec<Value>, key: &str, limit: usize) -> (Vec<Value>, us
     (items, total)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct FeedRecord {
+    #[serde(default)]
+    activity_id: Option<Value>,
+    #[serde(default)]
+    activity_type: Option<Value>,
+    #[serde(default)]
+    activity_subtype: Option<Value>,
+    #[serde(default)]
+    source_thread_id: Option<Value>,
+    #[serde(default)]
+    source_message_id: Option<Value>,
+    #[serde(default)]
+    message_id: Option<Value>,
+    #[serde(default)]
+    source_reply_chain_id: Option<Value>,
+    #[serde(default)]
+    source_user_id: Option<Value>,
+    #[serde(default)]
+    source_user_im_display_name: Option<Value>,
+    #[serde(default)]
+    message_preview: Option<Value>,
+    #[serde(default)]
+    timestamp: Option<Value>,
+    #[serde(default)]
+    is_read: Option<Value>,
+}
+
+fn deserialize_tolerant_message_map<'de, D>(deserializer: D) -> Result<HashMap<String, MentionChainMsg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct MapVisitor;
+    impl<'de> serde::de::Visitor<'de> for MapVisitor {
+        type Value = HashMap<String, MentionChainMsg>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of mention chain messages or null")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(HashMap::new())
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((k, v)) = map.next_entry::<String, Option<Value>>()? {
+                if let Some(val @ Value::Object(_)) = v {
+                    if let Ok(msg) = serde_json::from_value::<MentionChainMsg>(val) {
+                        out.insert(k, msg);
+                    }
+                }
+            }
+            Ok(out)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(HashMap::new())
+        }
+    }
+    deserializer.deserialize_any(MapVisitor)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MentionChainRecord {
+    #[serde(default)]
+    original_arrival_time: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_tolerant_message_map")]
+    message_map: HashMap<String, MentionChainMsg>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MentionChainMsg {
+    #[serde(default)]
+    original_arrival_time: Option<Value>,
+    #[serde(default)]
+    message_type: Option<Value>,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    properties: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HorizonRecord {
+    #[serde(default)]
+    conversation_id: Option<Value>,
+    #[serde(default)]
+    history_records: Option<Value>,
+}
+
+struct MentionRawFallback {
+    message_type: String,
+    content: String,
+    properties: Value,
+}
+
 #[derive(Default)]
 struct MentionDraft {
     chat_id: String,
@@ -254,32 +372,49 @@ struct MentionDraft {
     sender_id: Option<String>,
     sender: Option<String>,
     text: Option<String>,
+    raw_fallback: Option<MentionRawFallback>,
     is_read: Option<bool>,
 }
 
+struct FeedScan {
+    read_map: HashMap<(String, String), bool>,
+    unread_acts: Vec<Value>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn mention_items(
+fn collect_mentions_and_feed(
     conn: &Connection,
     me: Option<&str>,
     look: &Lookup,
-    feed: &[LatestRecord],
     lo: Option<i64>,
     hi: Option<i64>,
     chat_id: Option<&str>,
-) -> Result<Vec<Value>, ApiError> {
+    collect_unread_activities: bool,
+) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
     let mut items: HashMap<(String, String), MentionDraft> = HashMap::new();
+    let mut scan = FeedScan {
+        read_map: HashMap::new(),
+        unread_acts: Vec::new(),
+    };
 
-    let mut add = |cid: Option<String>,
-                   mid: Option<String>,
-                   thread_id: Option<String>,
-                   time_ms: Option<i64>,
-                   sender_id: Option<String>,
-                   sender: Option<String>,
-                   text: Option<String>,
-                   is_read: Option<bool>| {
+    let add = |items: &mut HashMap<(String, String), MentionDraft>,
+               cid: Option<String>,
+               mid: Option<String>,
+               thread_id: Option<String>,
+               time_ms: Option<i64>,
+               sender_id: Option<String>,
+               sender: Option<String>,
+               text: Option<String>,
+               raw_fallback: Option<MentionRawFallback>,
+               is_read: Option<bool>| {
         let (Some(c), Some(m)) = (cid, mid) else { return };
         if c.is_empty() || m.is_empty() {
             return;
+        }
+        if let Some(want_chat) = chat_id {
+            if c != want_chat {
+                return;
+            }
         }
         let e = items.entry((c.clone(), m.clone())).or_insert_with(|| MentionDraft {
             chat_id: c,
@@ -301,80 +436,130 @@ fn mention_items(
         if e.text.is_none() {
             e.text = text;
         }
+        if e.raw_fallback.is_none() {
+            e.raw_fallback = raw_fallback;
+        }
         if e.is_read.is_none() {
             e.is_read = is_read;
         }
     };
 
-    for (_, _, data) in latest(conn, &[MENTIONS])? {
-        let Some(chain) = as_obj(Some(&data)) else { continue };
-        let Some(mm) = chain.get("messageMap").and_then(|v| v.as_object()) else {
-            continue;
-        };
-        for mv in mm.values() {
-            let Some(m) = as_obj(Some(mv)) else { continue };
-            let props = as_obj(m.get("properties")).unwrap_or_default();
-            let a = as_obj(props.get("activity")).unwrap_or_default();
+    for_each_latest_typed::<MentionChainRecord>(conn, &[MENTIONS], |_, _, chain| {
+        let chain_oat = chain.original_arrival_time.as_ref().and_then(ms);
+        for m in chain.message_map.into_values() {
+            let props_cow = as_obj(m.properties.as_ref()).unwrap_or_default();
+            let a = as_obj(props_cow.get("activity")).unwrap_or_default();
             if let (Some(me_s), Some(target)) = (me, non_empty_str(a.get("targetUserId"))) {
                 if !same_person(Some(&target), Some(me_s)) {
                     continue;
                 }
             }
-            let is_read = match props.get("isread") {
+            let cid = non_empty_str(a.get("sourceThreadId"));
+            if let Some(want_chat) = chat_id {
+                if cid.as_deref() != Some(want_chat) {
+                    continue;
+                }
+            }
+            let t = a
+                .get("activityTimestamp")
+                .and_then(to_ms)
+                .or_else(|| m.original_arrival_time.as_ref().and_then(ms))
+                .or(chain_oat);
+            if t.is_some() && !in_window(t, lo, hi) {
+                continue;
+            }
+            let is_read = match props_cow.get("isread") {
                 Some(Value::Bool(b)) => Some(*b),
                 Some(Value::String(s)) if s == "true" => Some(true),
                 Some(Value::String(s)) if s == "false" => Some(false),
                 _ => None,
             };
-            let t = a
-                .get("activityTimestamp")
-                .and_then(to_ms)
-                .or_else(|| m.get("originalArrivalTime").and_then(ms))
-                .or_else(|| chain.get("originalArrivalTime").and_then(ms));
-            let rendered = render_raw_msg(&m, look);
-            let txt = if !rendered.is_empty() {
-                Some(rendered)
-            } else {
-                non_empty_str(a.get("messagePreview"))
-            };
+            let mid = a.get("sourceMessageId").and_then(clean_id);
+            let reply_id = a.get("sourceReplyChainId").and_then(clean_id);
+            let src_uid = non_empty_str(a.get("sourceUserId"));
+            let src_name = non_empty_str(a.get("sourceUserImDisplayName"));
+            let preview_txt = non_empty_str(a.get("messagePreview"));
+            drop(a);
+            drop(props_cow);
+            let fallback = m
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|content| MentionRawFallback {
+                    message_type: m
+                        .message_type
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("RichText/Html")
+                        .to_string(),
+                    content: content.to_string(),
+                    properties: m.properties.unwrap_or(Value::Null),
+                });
             add(
-                non_empty_str(a.get("sourceThreadId")),
-                a.get("sourceMessageId").and_then(clean_id),
-                a.get("sourceReplyChainId").and_then(clean_id),
+                &mut items,
+                cid,
+                mid,
+                reply_id,
                 t,
-                non_empty_str(a.get("sourceUserId")),
-                non_empty_str(a.get("sourceUserImDisplayName")),
-                txt,
+                src_uid,
+                src_name,
+                preview_txt,
+                fallback,
                 is_read,
             );
         }
-    }
+    })?;
 
-    let mut read_map: HashMap<(String, String), bool> = HashMap::new();
-    for (_, _, data) in feed {
-        let Some(f) = as_obj(Some(data)) else { continue };
-        if f.get("activityType").and_then(|v| v.as_str()) != Some("mention") {
-            continue;
+    for_each_latest_typed::<FeedRecord>(conn, &[FEED], |_, key, f| {
+        let t = f.timestamp.as_ref().and_then(to_ms);
+        let is_read = f.is_read.as_ref().and_then(Value::as_bool);
+        let activity_type = f.activity_type.as_ref().and_then(Value::as_str);
+        if collect_unread_activities && is_read == Some(false) && (lo.is_none() || t.unwrap_or(0) >= lo.unwrap()) {
+            let cid = non_empty_str(f.source_thread_id.as_ref());
+            let pv = non_empty_str(f.message_preview.as_ref()).map(|s| preview(Some(&s)));
+            scan.unread_acts.push(json!({
+                "id": non_empty_str(f.activity_id.as_ref()).unwrap_or_else(|| key.to_string()),
+                "activityType": activity_type.filter(|s| !s.is_empty()),
+                "activitySubtype": non_empty_str(f.activity_subtype.as_ref()),
+                "chatId": cid,
+                "chatName": look.chat_name(cid.as_deref()),
+                "messageId": f.source_message_id.as_ref().and_then(clean_id).or_else(|| f.message_id.as_ref().and_then(clean_id)),
+                "sender": look.name(non_empty_str(f.source_user_id.as_ref()).as_deref(), non_empty_str(f.source_user_im_display_name.as_ref()).as_deref()),
+                "preview": pv.filter(|s| !s.is_empty()),
+                "time": iso(t),
+                "timeMs": t,
+            }));
         }
-        let cid = non_empty_str(f.get("sourceThreadId"));
+        if activity_type != Some("mention") {
+            return;
+        }
+        let cid = non_empty_str(f.source_thread_id.as_ref());
         let mid = f
-            .get("sourceMessageId")
+            .source_message_id
+            .as_ref()
             .and_then(clean_id)
-            .or_else(|| f.get("messageId").and_then(clean_id));
-        if let (Some(b), Some(ref c), Some(ref m)) = (f.get("isRead").and_then(|v| v.as_bool()), &cid, &mid) {
-            read_map.insert((c.clone(), m.clone()), b);
+            .or_else(|| f.message_id.as_ref().and_then(clean_id));
+        if let (Some(b), Some(ref c), Some(ref m)) = (is_read, &cid, &mid) {
+            scan.read_map.insert((c.clone(), m.clone()), b);
+        }
+        if t.is_some() && !in_window(t, lo, hi) {
+            return;
         }
         add(
+            &mut items,
             cid,
             mid,
-            f.get("sourceReplyChainId").and_then(clean_id),
-            f.get("timestamp").and_then(to_ms),
-            non_empty_str(f.get("sourceUserId")),
-            non_empty_str(f.get("sourceUserImDisplayName")),
-            non_empty_str(f.get("messagePreview")),
+            f.source_reply_chain_id.as_ref().and_then(clean_id),
+            t,
+            non_empty_str(f.source_user_id.as_ref()),
+            non_empty_str(f.source_user_im_display_name.as_ref()),
+            non_empty_str(f.message_preview.as_ref()),
+            None,
             None,
         );
-    }
+    })?;
 
     if let Some(me_s) = me {
         let me_oid = identity::oid(me_s);
@@ -410,7 +595,7 @@ fn mention_items(
                 if same_person(sm.as_deref(), Some(me_s)) {
                     continue;
                 }
-                add(Some(c), Some(m), None, None, None, None, None, None);
+                add(&mut items, Some(c), Some(m), None, None, None, None, None, None, None);
             }
         }
     }
@@ -420,7 +605,7 @@ fn mention_items(
     let mut out = Vec::with_capacity(items.len());
     for (key, mut it) in items {
         let row = archived.get(&key);
-        if let Some(&b) = read_map.get(&key) {
+        if let Some(&b) = scan.read_map.get(&key) {
             it.is_read = Some(b);
         }
         let sender_id = row.and_then(|r| r.sender_mri.clone()).or(it.sender_id);
@@ -431,6 +616,24 @@ fn mention_items(
             .unwrap_or_default();
         let text = row
             .and_then(|r| r.text.as_deref().filter(|s| !s.is_empty()).map(String::from))
+            .or_else(|| {
+                it.raw_fallback
+                    .as_ref()
+                    .map(|rf| {
+                        let owned_props;
+                        let props_ref: &Value = match &rf.properties {
+                            v @ Value::Object(_) => v,
+                            other => {
+                                owned_props = as_obj(Some(other))
+                                    .map(|c| Value::Object(c.into_owned()))
+                                    .unwrap_or_else(|| json!({}));
+                                &owned_props
+                            }
+                        };
+                        render_text(&rf.message_type, &rf.content, props_ref, &|mri| look.name_of(mri)).1
+                    })
+                    .filter(|s| !s.is_empty())
+            })
             .or(it.text)
             .unwrap_or_default();
         out.push(json!({
@@ -447,7 +650,7 @@ fn mention_items(
             "isRead": it.is_read,
         }));
     }
-    Ok(out)
+    Ok((out, scan.unread_acts))
 }
 
 pub fn mentions(
@@ -468,8 +671,8 @@ pub fn mentions(
     };
     let me = archive::me_mri(conn);
     let look = Lookup::new(conn)?;
-    let feed = latest(conn, &[FEED])?;
-    let items: Vec<Value> = mention_items(conn, me.as_deref(), &look, &feed, lo, hi, chat_id.as_deref())?
+    let (raw_mentions, _) = collect_mentions_and_feed(conn, me.as_deref(), &look, lo, hi, chat_id.as_deref(), false)?;
+    let items: Vec<Value> = raw_mentions
         .into_iter()
         .filter(|m| {
             let t = m.get("timeMs").and_then(|v| v.as_i64());
@@ -555,10 +758,9 @@ pub fn read_state(conn: &Connection) -> Result<HashMap<String, ConvReadState>, A
     }
 
     let mut best: HashMap<String, (i64, Option<bool>)> = HashMap::new();
-    for (_, key, data) in latest(conn, &[HORIZON_HISTORY])? {
-        let Some(d) = as_obj(Some(&data)) else { continue };
-        let cid = non_empty_str(d.get("conversationId")).unwrap_or(key);
-        for h in as_arr(d.get("historyRecords")).iter() {
+    for_each_latest_typed::<HorizonRecord>(conn, &[HORIZON_HISTORY], |_, key, d| {
+        let cid = non_empty_str(d.conversation_id.as_ref()).unwrap_or_else(|| key.to_string());
+        for h in as_arr(d.history_records.as_ref()).iter() {
             let after = as_obj(h.get("afterUpdate")).unwrap_or_default();
             let t = archive::horizon_first(after.get("consumptionHorizon"));
             let cur_t = best.get(&cid).map(|x| x.0).unwrap_or(0);
@@ -566,7 +768,7 @@ pub fn read_state(conn: &Connection) -> Result<HashMap<String, ConvReadState>, A
                 best.insert(cid.clone(), (t, after.get("isRead").and_then(|v| v.as_bool())));
             }
         }
-    }
+    })?;
     for (cid, (t, is_read)) in best {
         if let Some(st) = out.get_mut(&cid) {
             if t > st.horizon {
@@ -615,6 +817,107 @@ fn inbox_message_summary(
     look: &Lookup,
     cids: Option<&[String]>,
 ) -> Result<InboxSummary, ApiError> {
+    if let Some(ids) = cids {
+        let mut last = HashMap::with_capacity(ids.len());
+        let mut mine_at: HashMap<String, i64> = HashMap::new();
+        let mut other_at: HashMap<String, i64> = HashMap::new();
+        if ids.is_empty() {
+            return Ok((last, mine_at, other_at));
+        }
+
+        let mut latest_stmt = conn.prepare(
+            "SELECT message_id, arrived_at, sender_mri, sender_name, text \
+             FROM messages WHERE conversation_id = ? AND kind = 'message' \
+             ORDER BY arrived_at DESC, pk DESC LIMIT 1",
+        )?;
+        let mut mine_stmt = if !me_mris.is_empty() {
+            let qs = vec!["?"; me_mris.len()].join(",");
+            Some(conn.prepare(&format!(
+                "SELECT arrived_at FROM messages \
+                 WHERE conversation_id = ? AND kind = 'message' AND sender_mri IN ({qs}) \
+                 ORDER BY arrived_at DESC LIMIT 1"
+            ))?)
+        } else {
+            None
+        };
+        let other_sql = if !me_mris.is_empty() {
+            let qs = vec!["?"; me_mris.len()].join(",");
+            format!(
+                "SELECT arrived_at FROM messages \
+                 WHERE conversation_id = ? AND kind = 'message' \
+                   AND sender_mri != '' AND sender_mri IS NOT NULL AND sender_mri NOT IN ({qs}) \
+                 ORDER BY arrived_at DESC LIMIT 1"
+            )
+        } else {
+            "SELECT arrived_at FROM messages \
+             WHERE conversation_id = ? AND kind = 'message' \
+               AND sender_mri != '' AND sender_mri IS NOT NULL \
+             ORDER BY arrived_at DESC LIMIT 1"
+                .to_string()
+        };
+        let mut other_stmt = conn.prepare(&other_sql)?;
+        let me_set: HashSet<&str> = me_mris.iter().map(String::as_str).collect();
+        let mut me_params: Vec<SqlVal> = Vec::with_capacity(1 + me_mris.len());
+        me_params.push(SqlVal::Null);
+        for m in me_mris {
+            me_params.push(SqlVal::Text(m.clone()));
+        }
+
+        for cid in ids {
+            let mut rows = latest_stmt.query([cid])?;
+            let Some(r) = rows.next()? else { continue };
+            let mid: String = r.get(0)?;
+            let arr_opt: Option<i64> = r.get(1)?;
+            let Some(arr) = arr_opt else { continue };
+            let smri: Option<String> = r.get(2)?;
+            let sname: Option<String> = r.get(3)?;
+            let text: Option<String> = r.get(4)?;
+            drop(rows);
+
+            let is_me = smri.as_deref().is_some_and(|s| me_set.contains(s));
+            let is_other = smri.as_deref().is_some_and(|s| !s.is_empty() && !me_set.contains(s));
+            me_params[0] = SqlVal::Text(cid.clone());
+
+            if is_me {
+                mine_at.insert(cid.clone(), arr);
+            } else if let Some(ref mut mstmt) = mine_stmt {
+                let mut mrows = mstmt.query(params_from_iter(me_params.iter()))?;
+                if let Some(mrow) = mrows.next()? {
+                    if let Some(mts) = mrow.get::<_, Option<i64>>(0)? {
+                        mine_at.insert(cid.clone(), mts);
+                    }
+                }
+            }
+
+            if is_other {
+                other_at.insert(cid.clone(), arr);
+            } else {
+                let mut orows = other_stmt.query(params_from_iter(me_params.iter()))?;
+                if let Some(orow) = orows.next()? {
+                    if let Some(ots) = orow.get::<_, Option<i64>>(0)? {
+                        other_at.insert(cid.clone(), ots);
+                    }
+                }
+            }
+
+            let sender = sname
+                .filter(|s| !s.is_empty())
+                .or_else(|| look.name(smri.as_deref(), None))
+                .or_else(|| smri.clone());
+            last.insert(
+                cid.clone(),
+                LastMsg {
+                    message_id: mid,
+                    arrived_at: arr,
+                    sender_mri: smri,
+                    sender,
+                    text,
+                },
+            );
+        }
+        return Ok((last, mine_at, other_at));
+    }
+
     let mut max_any_pairs: Vec<(String, i64)> = Vec::new();
     let mut mine_at: HashMap<String, i64> = HashMap::new();
     let mut other_at: HashMap<String, i64> = HashMap::new();
@@ -668,15 +971,7 @@ fn inbox_message_summary(
         Ok(())
     };
 
-    match cids {
-        None => scan("", &[])?,
-        Some(ids) => {
-            for chunk in ids.chunks(400) {
-                let qs = vec!["?"; chunk.len()].join(",");
-                scan(&format!("AND conversation_id IN ({qs})"), chunk)?;
-            }
-        }
-    }
+    scan("", &[])?;
 
     let mut last = HashMap::new();
     for chunk in max_any_pairs.chunks(300) {
@@ -890,8 +1185,8 @@ pub fn inbox(conn: &Connection, since: Option<&str>, limit: usize) -> Result<Val
         });
     }
 
-    let feed = latest(conn, &[FEED])?;
-    let mut all_mentions: Vec<Value> = mention_items(conn, me.as_deref(), &look, &feed, lo, None, None)?
+    let (raw_mentions, mut unread_acts) = collect_mentions_and_feed(conn, me.as_deref(), &look, lo, None, None, true)?;
+    let mut all_mentions: Vec<Value> = raw_mentions
         .into_iter()
         .filter(|m| in_window(m.get("timeMs").and_then(|v| v.as_i64()), lo, None))
         .collect();
@@ -904,28 +1199,6 @@ pub fn inbox(conn: &Connection, since: Option<&str>, limit: usize) -> Result<Val
     });
     let total_mentions = all_mentions.len();
 
-    let mut unread_acts: Vec<Value> = Vec::new();
-    for (_, key, data) in &feed {
-        let Some(f) = as_obj(Some(data)) else { continue };
-        let t = f.get("timestamp").and_then(to_ms);
-        if f.get("isRead") != Some(&Value::Bool(false)) || (lo.is_some() && t.unwrap_or(0) < lo.unwrap()) {
-            continue;
-        }
-        let cid = non_empty_str(f.get("sourceThreadId"));
-        let pv = non_empty_str(f.get("messagePreview")).map(|s| preview(Some(&s)));
-        unread_acts.push(json!({
-            "id": non_empty_str(f.get("activityId")).unwrap_or_else(|| key.clone()),
-            "activityType": non_empty_str(f.get("activityType")),
-            "activitySubtype": non_empty_str(f.get("activitySubtype")),
-            "chatId": cid,
-            "chatName": look.chat_name(cid.as_deref()),
-            "messageId": f.get("sourceMessageId").and_then(clean_id).or_else(|| f.get("messageId").and_then(clean_id)),
-            "sender": look.name(non_empty_str(f.get("sourceUserId")).as_deref(), non_empty_str(f.get("sourceUserImDisplayName")).as_deref()),
-            "preview": pv.filter(|s| !s.is_empty()),
-            "time": iso(t),
-            "timeMs": t,
-        }));
-    }
     unread_acts.sort_by(|a, b| {
         b.get("timeMs")
             .and_then(|v| v.as_i64())

@@ -1,8 +1,8 @@
 # teams-cli
 
-Local-first archive, CLI, and loopback HTTP API for Microsoft Teams (v2) on macOS.
+Local-first archive, CLI, and scoped loopback HTTP API for Microsoft Teams (v2) on macOS.
 
-Reads the Teams desktop IndexedDB/LevelDB cache into an append-only SQLite archive (`~/Library/Application Support/teams-cli/archive.sqlite3`) so messages, edits, deletions, attachments, calls, and meetings are kept permanently even after Teams evicts them.
+Reads the Teams desktop IndexedDB/LevelDB cache into an append-only SQLite archive (`~/Library/Application Support/teams-cli/archive.sqlite3`) so messages, edits, deletions, attachments, calls, and meetings are kept permanently even after Teams evicts them — and supports live Teams actions (sending messages with Markdown, `@mentions`, quotes, inline images, and OneDrive/SharePoint file attachments; reactions, edits, deletes, pins, saves, forwards, chat management, and live presence) protected by explicit guardrails and scoped bearer tokens.
 
 ## Install
 
@@ -26,9 +26,11 @@ teams daemon install
 teams doctor
 ```
 
-Update anytime with `teams update` (`teams update --check` to check without installing). Interactive commands check GitHub releases at most once every 24 hours and show a notice when a newer version is available (set `TEAMS_CLI_NO_UPDATE_CHECK=1` to disable). Prebuilt binaries and `SHA256SUMS.txt` are on [GitHub Releases](https://github.com/sasanktumpati/teams-cli/releases); verify provenance with `gh attestation verify teams-*.tar.gz -R sasanktumpati/teams-cli`.
+To allow scoped live write routes on the local HTTP API, opt in explicitly:
 
-On first run, allow macOS to access `~/Library/Containers/com.microsoft.teams2/`.
+```sh
+teams daemon install --allow-writes
+```
 
 ### Shell Completions
 
@@ -40,7 +42,7 @@ teams completions bash > ~/.local/share/bash-completion/completions/teams
 
 ## Usage
 
-Run `teams docs` for the full command, flag, and JSON schema reference.
+Run `teams docs` for the full command, scope, flag, and HTTP API reference.
 
 ```sh
 teams status
@@ -49,52 +51,62 @@ teams sync
 
 teams inbox
 teams mentions --unread
-teams chats --grep "project"
-teams chats --member alice@example.com
-teams messages "Project" --since 7d
-teams messages --around 1795219003436 --context 10
+teams chat list --grep "project"
+teams chat list --member alice@example.com
+teams msg list "Project" --since 7d
+teams msg list --around 1795219003436 --context 10
+teams msg saved
+teams msg pinned
 
 teams search "launch plan" -draft --from Bob --since 30d
 teams search '"exact phrase" OR other' --relevance
-teams search budget --include-history
+teams search budget --history
 teams search --has-attachments --since 30d
-teams search --from Alice --count
 
 teams people --grep alice
 teams people alice@example.com
-teams attachments --type pdf --since 30d
+teams file list --type pdf --since 30d
+teams file fetch --message 1795219003436
 teams changes --since 7d
 teams calls --missed
 teams meetings --since today
-teams saved
-teams pinned
-teams export "Project" --out ~/project.md
+teams chat export "Project" --out ~/project.md
 
-teams fetch --message 1795219003436
-teams send 48:notes "hello" --dry-run
+teams msg send 48:notes "**Shipped!**" --markdown --file ./report.pdf --image ./shot.png --dry-run
+teams msg react 48:notes/1795219003436 👍
+teams msg edit 48:notes/1795219003436 "Updated copy" --dry-run
+teams msg forward 1795219003436 48:notes --comment "FYI" --dry-run
+teams chat new alice@example.com bob@example.com --topic "Launch" --dry-run
+teams chat read "Project"
+teams presence
+teams presence set dnd --for 2h
+teams presence message set "Heads down" --for 2h
 ```
 
-Add `--json` to any read command for machine-readable output matching the HTTP API.
+Add `--json` to commands for machine-readable output matching the HTTP API.
 
-Exit codes: `0` ok, `1` runtime/health error, `2` usage/parameter error.
+Exit codes: `0` ok, `1` runtime/health/auth/policy error, `2` usage/parameter error.
 
-## Local HTTP API & Auth
+## Local HTTP API & Scoped Tokens
 
 The background daemon (`teams daemon install`) listens on `http://127.0.0.1:47613` (`TEAMS_CLI_PORT` to override) and checks for cache changes every 60s.
 
 - `GET /health` is unauthenticated.
 - All `/v1/*` routes require `Authorization: Bearer <token>` and reject non-loopback `Host`, `Origin`, and cross-site `Sec-Fetch-Site` headers.
-- All endpoints are read-only except `POST /v1/sync`. `fetch` and `send` are CLI-only (`send` requires both `TEAMS_CLI_ENABLE_SEND=1` and `--yes`).
+- Every named token has explicit scopes (defaulting to `read` only) and an optional exact-ID chat allowlist (`--chats`) that restricts live chat write actions (archive reads are not chat-filtered).
+- Live write routes under `/v1/live/*` require both `--allow-writes` on the daemon and a token carrying the exact scope (`send`, `modify`, `react`, `mark-read`, `chat:manage`, `presence:write`).
 
 ```sh
-teams token create my-script --expires 30d
+teams token create reader --expires 30d
+teams token create executor --scope read,sync --expires 90d
+teams token create notifier --scope read,send,react --chats "Engineering,48:notes" --expires 30d
 teams token list
-teams token revoke my-script
+teams token revoke notifier
 teams token prune
 ```
 
 ```sh
-TOKEN=$(teams token create my-script --expires 30d)
+TOKEN=$(teams token create reader --expires 30d)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:47613/v1/status
 ```
 
@@ -103,7 +115,7 @@ An optional typed Executor wrapper lives in `executor-app/` (`executor-app/deplo
 ## Operations
 
 ```sh
-teams daemon status | restart | uninstall | logs [--follow] | run
+teams daemon status | restart | uninstall | logs [--follow] | run [--allow-writes]
 teams archive verify | migrations | reindex
 teams archive backup --out ~/teams-backup.sqlite3.xz
 teams archive restore ~/teams-backup.sqlite3.xz --yes

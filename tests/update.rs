@@ -382,5 +382,13 @@ fn update_notice_modes_respect_json_and_machine_commands() {
     assert_eq!(mode(&["teams", "token", "list"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "token", "create", "ci"]), UpdateNoticeMode::None);
     assert_eq!(mode(&["teams", "completions", "zsh"]), UpdateNoticeMode::None);
-    assert_eq!(mode(&["teams", "export", "General"]), UpdateNoticeMode::None);
+    assert_eq!(mode(&["teams", "chat", "export", "General"]), UpdateNoticeMode::None);
+    assert_eq!(
+        mode(&["teams", "msg", "send", "48:notes", "hi"]),
+        UpdateNoticeMode::Full
+    );
+    assert_eq!(
+        mode(&["teams", "msg", "send", "48:notes", "hi", "--json"]),
+        UpdateNoticeMode::None
+    );
 }

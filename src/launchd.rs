@@ -44,7 +44,7 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-pub fn install(interval: u64, port_opt: Option<u16>) -> Result<PathBuf, String> {
+pub fn install(interval: u64, port_opt: Option<u16>, allow_writes: bool) -> Result<PathBuf, String> {
     let exe = executable();
     let exe_parent = PathBuf::from(&exe)
         .parent()
@@ -52,6 +52,11 @@ pub fn install(interval: u64, port_opt: Option<u16>) -> Result<PathBuf, String> 
         .unwrap_or_else(|| "/usr/local/bin".to_string());
     let log_dir = paths::log_dir();
     let port = port_opt.unwrap_or_else(paths::port);
+    let writes_arg = if allow_writes {
+        "\n\t\t<string>--allow-writes</string>"
+    } else {
+        ""
+    };
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -76,7 +81,7 @@ pub fn install(interval: u64, port_opt: Option<u16>) -> Result<PathBuf, String> 
 		<string>--interval</string>
 		<string>{interval}</string>
 		<string>--port</string>
-		<string>{port}</string>
+		<string>{port}</string>{writes_arg}
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -94,6 +99,7 @@ pub fn install(interval: u64, port_opt: Option<u16>) -> Result<PathBuf, String> 
         exe = xml_escape(&exe),
         interval = interval,
         port = port,
+        writes_arg = writes_arg,
         err_log = xml_escape(&log_dir.join("launchd.err.log").to_string_lossy()),
         out_log = xml_escape(&log_dir.join("launchd.out.log").to_string_lossy()),
     );
@@ -159,7 +165,7 @@ pub fn loaded() -> bool {
 pub fn start() -> Result<PathBuf, String> {
     let path = plist_path();
     if !path.exists() {
-        return install(paths::DEFAULT_SYNC_INTERVAL, None);
+        return install(paths::DEFAULT_SYNC_INTERVAL, None, false);
     }
     if loaded() {
         return Ok(path);
@@ -208,7 +214,7 @@ pub fn plist_executable(plist_path: &Path) -> Option<String> {
 pub fn restart() -> Result<PathBuf, String> {
     let path = plist_path();
     if !path.exists() {
-        return install(paths::DEFAULT_SYNC_INTERVAL, None);
+        return install(paths::DEFAULT_SYNC_INTERVAL, None, false);
     }
     if let Ok(text) = fs::read_to_string(&path) {
         let old = "<string>daemon</string>\n\t\t<string>--interval</string>";
@@ -229,10 +235,18 @@ pub fn restart() -> Result<PathBuf, String> {
     bootstrap(&path)
 }
 
+pub fn plist_allow_writes(plist_path: &Path) -> Option<bool> {
+    let text = fs::read_to_string(plist_path).ok()?;
+    let after_key = text.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key.split("</array>").next()?;
+    Some(array.contains("<string>--allow-writes</string>"))
+}
+
 pub fn status() -> Value {
     let path = plist_path();
     let installed = path.exists();
     let plist_exe = plist_executable(&path);
+    let allow_writes = plist_allow_writes(&path);
     let current_exe = executable();
     let executable_matches = plist_exe.as_deref().map(|p| p == current_exe);
     let Ok(out) = Command::new("launchctl")
@@ -242,6 +256,7 @@ pub fn status() -> Value {
         return json!({
             "installed": installed,
             "loaded": false,
+            "allowWrites": allow_writes,
             "plistExecutable": plist_exe,
             "executableMatches": executable_matches,
         });
@@ -250,6 +265,7 @@ pub fn status() -> Value {
         return json!({
             "installed": installed,
             "loaded": false,
+            "allowWrites": allow_writes,
             "plistExecutable": plist_exe,
             "executableMatches": executable_matches,
         });
@@ -259,6 +275,7 @@ pub fn status() -> Value {
     json!({
         "installed": installed,
         "loaded": true,
+        "allowWrites": allow_writes,
         "state": pick(&STATE_RE),
         "pid": pick(&PID_RE),
         "lastExitCode": pick(&EXIT_RE),

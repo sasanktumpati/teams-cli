@@ -31,9 +31,9 @@ const teamsArchive = defineProvider({
   auth: {
     token: secrets({
       label: "API token",
-      guide: "Run `teams token create executor` on your Mac and paste the token below.",
+      guide: "Run `teams token create executor --scope read,sync` on your Mac and paste the token below.",
       fields: object({
-        token: string({ description: "Bearer token created by `teams token create executor`" }),
+        token: string({ description: "Bearer token created by `teams token create executor --scope read,sync`" }),
       }),
       request: ({ token }) => bearer(token),
     }),
@@ -510,7 +510,7 @@ async function call(
     const details = body.error?.details !== undefined ? ` (${JSON.stringify(body.error.details)})` : "";
     const hint =
       res.status === 401
-        ? " Create a new token with `teams token create executor` and reconnect the Teams Archive account."
+        ? " Create a new token with `teams token create executor --scope read,sync` and reconnect the Teams Archive account."
         : "";
     throw new Error(
       `teams ${body.error?.code ?? res.status}: ${body.error?.message ?? res.statusText}${details}${hint}`,

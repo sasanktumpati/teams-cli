@@ -21,8 +21,8 @@ fn teams_env(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Out {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_teams"));
     cmd.args(args)
         .env("TEAMS_CLI_HOME", home)
-        .env_remove("TEAMS_CLI_ENABLE_SEND")
-        .env_remove("TEAMS_CLI_SEND_ALLOWLIST")
+        .env_remove("TEAMS_CLI_ENABLE_WRITES")
+        .env_remove("TEAMS_CLI_WRITE_ALLOWLIST")
         .env("TEAMS_CLI_SOURCE", home.join("no-teams-cache"))
         .env("HOME", home)
         .env("TZ", "UTC");
@@ -63,7 +63,9 @@ fn docs_lists_every_command_and_flag() {
             continue;
         }
         assert!(
-            text.contains(&format!("teams {name} ")) || text.contains(&format!("teams {name}\n")),
+            text.contains(&format!("teams {name} "))
+                || text.contains(&format!("teams {name}|"))
+                || text.contains(&format!("teams {name}\n")),
             "{name}"
         );
         let mut subs: Vec<&clap::Command> = vec![sub];
@@ -91,17 +93,20 @@ fn docs_lists_every_command_and_flag() {
         "countOnly",
         "fetch",
         "send",
+        "/v1/live/messages",
+        "/v1/live/chats",
+        "/v1/live/presence",
     ] {
         assert!(text.contains(route), "{route}");
     }
-    assert!(text.contains("[RESTRICTED]"));
-    assert!(text.len() < 10000, "stays a one-page read");
+    assert!(text.contains("TEAMS_CLI_ENABLE_WRITES"));
+    assert!(text.len() < 12000, "stays a concise single-page reference");
 }
 
 #[test]
 fn messages_around_without_chat() {
     let (_td, h) = home();
-    let o = teams(&h, &["messages", "--around", MID, "--context", "1"]);
+    let o = teams(&h, &["msg", "list", "--around", MID, "--context", "1"]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(o.out.contains("Launch crew"));
     assert!(o.out.contains("# earlier messages exist") && o.out.contains("# later messages exist"));
@@ -109,7 +114,14 @@ fn messages_around_without_chat() {
     assert!(o.out.contains("group note 3"));
     let r = teams_json(
         &h,
-        &["messages", "--around", &format!("{GROUP}/{MID}"), "--context", "1"],
+        &[
+            "message",
+            "list",
+            "--around",
+            &format!("{GROUP}/{MID}"),
+            "--context",
+            "1",
+        ],
     );
     assert_eq!(r["aroundMessageId"], MID);
     assert_eq!(r["messages"].as_array().unwrap().len(), 3);
@@ -118,7 +130,7 @@ fn messages_around_without_chat() {
 #[test]
 fn messages_needs_chat_or_around() {
     let (_td, h) = home();
-    let o = teams(&h, &["messages"]);
+    let o = teams(&h, &["msg", "list"]);
     assert_eq!(o.code, 2);
     assert!(o.err.contains("chat is required"), "{}", o.err);
 }
@@ -126,7 +138,7 @@ fn messages_needs_chat_or_around() {
 #[test]
 fn chats_member() {
     let (_td, h) = home();
-    let r = teams_json(&h, &["chats", "--member", "bob@corp.test"]);
+    let r = teams_json(&h, &["chat", "list", "--member", "bob@corp.test"]);
     let ids: Vec<&str> = r["chats"]
         .as_array()
         .unwrap()
@@ -135,7 +147,7 @@ fn chats_member() {
         .collect();
     assert_eq!(ids, vec![DM_BOB]);
     assert_eq!(r["memberMatches"][0]["id"], BOB);
-    let o = teams(&h, &["chats", "--member", "o"]);
+    let o = teams(&h, &["chat", "list", "--member", "o"]);
     assert_eq!(o.code, 0);
     assert!(o.err.contains("matched") && o.err.contains("people"), "{}", o.err);
 }
@@ -158,7 +170,7 @@ fn search_count_and_history() {
     );
 
     assert!(teams(&h, &["search", "budget"]).out.contains("0 of 0"));
-    let o = teams(&h, &["search", "budget", "--include-history"]);
+    let o = teams(&h, &["search", "budget", "--history"]);
     assert_eq!(o.code, 0);
     assert!(o.out.contains("(matched earlier version)") && o.out.contains("earlier version"));
     assert!(o.out.contains("budget draft v1") && o.out.contains("final numbers"));
@@ -235,11 +247,11 @@ fn mentions_calls_meetings_saved_pinned() {
     }
     assert_eq!(teams_json(&h, &["meetings", "--grep", "nothing"])["matched"], 0);
 
-    let o = teams(&h, &["saved", "--all"]);
+    let o = teams(&h, &["msg", "saved", "--include-unsaved"]);
     assert!(o.code == 0 && o.out.contains("group note 1") && o.out.contains("Launch crew"));
-    let o = teams(&h, &["pinned", "--chat", "Launch"]);
+    let o = teams(&h, &["msg", "pinned", "--chat", "Launch"]);
     assert!(o.code == 0 && o.out.contains("Subject: Rota") && o.out.contains("group note 2"));
-    assert_eq!(teams_json(&h, &["pinned"])["matched"], 1);
+    assert_eq!(teams_json(&h, &["msg", "pinned"])["matched"], 1);
 }
 
 #[test]
@@ -263,17 +275,17 @@ fn status_changes_records_people_attachments_json() {
     assert!(src.to_string().contains(CALLS), "{src}");
     let p = teams_json(&h, &["people", "--grep", "ada"]);
     assert_eq!(p["people"][0]["id"], ADA);
-    assert!(teams_json(&h, &["attachments"]).get("attachments").is_some());
+    assert!(teams_json(&h, &["file", "list"]).get("attachments").is_some());
 }
 
 #[test]
 fn export_stdout_and_private_file() {
     let (td, h) = home();
-    let o = teams(&h, &["export", "Launch crew", "--history"]);
+    let o = teams(&h, &["chat", "export", "Launch crew", "--history"]);
     assert_eq!(o.code, 0);
     assert!(o.out.starts_with("# Launch crew") && o.out.contains("final numbers"));
     let dest = td.path().join("out.md");
-    let o = teams(&h, &["export", "Launch crew", "--out", dest.to_str().unwrap()]);
+    let o = teams(&h, &["chat", "export", "Launch crew", "--out", dest.to_str().unwrap()]);
     assert_eq!((o.code, o.out.as_str()), (0, ""));
     assert!(std::fs::read_to_string(&dest).unwrap().starts_with("# Launch crew"));
     assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
@@ -335,8 +347,8 @@ fn backup_then_restore_dry_run_and_damaged_backup() {
 fn rejects_bad_numbers_with_exit_2() {
     let td = tempfile::tempdir().unwrap();
     for argv in [
-        &["chats", "--limit", "-1"][..],
-        &["messages", "x", "--context", "-2"],
+        &["chat", "list", "--limit", "-1"][..],
+        &["msg", "list", "x", "--context", "-2"],
         &["search", "x", "--limit", "nope"],
     ] {
         let o = teams(td.path(), argv);
@@ -358,7 +370,7 @@ fn unknown_command_is_usage_error() {
 #[test]
 fn no_archive_yet_is_a_clean_error() {
     let td = tempfile::tempdir().unwrap();
-    let o = teams(td.path(), &["chats"]);
+    let o = teams(td.path(), &["chat", "list"]);
     assert_ne!(o.code, 0);
     assert!(o.err.starts_with("teams: "), "{}", o.err);
     assert!(!o.err.contains("panicked"), "{}", o.err);
@@ -367,7 +379,7 @@ fn no_archive_yet_is_a_clean_error() {
 #[test]
 fn fetch_needs_a_target() {
     let (_td, h) = home();
-    let o = teams(&h, &["fetch"]);
+    let o = teams(&h, &["file", "fetch"]);
     assert_eq!(o.code, 2);
     assert!(o.err.contains("Provide a URL"), "{}", o.err);
 }
@@ -375,35 +387,38 @@ fn fetch_needs_a_target() {
 #[test]
 fn send_is_restricted_and_dry_run_by_default() {
     let (_td, h) = home();
-    let o = teams(&h, &["send", "48:notes"]);
+    let o = teams(&h, &["msg", "send", "48:notes"]);
     assert_eq!(o.code, 2);
-    assert!(o.err.contains("Provide message text"), "{}", o.err);
+    assert!(o.err.contains("Message text"), "{}", o.err);
 
-    let o = teams(&h, &["send", "48:notes", "hello", "world"]);
+    let o = teams(&h, &["msg", "send", "48:notes", "hello", "world"]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(
         o.out.contains("RESTRICTED") && o.out.contains("Nothing was sent"),
         "{}",
         o.out
     );
-    let r = teams_json(&h, &["send", "48:notes", "hello"]);
+    let r = teams_json(&h, &["msg", "send", "48:notes", "hello"]);
     assert_eq!(
         (r["dryRun"].as_bool(), r["restricted"].as_bool(), r["sent"].as_bool()),
         (Some(true), Some(true), Some(false))
     );
 
-    let o = teams(&h, &["send", "48:notes", "hello", "--yes"]);
+    let o = teams(&h, &["msg", "send", "48:notes", "hello", "--yes"]);
     assert_eq!(o.code, 1);
-    assert!(o.err.contains("TEAMS_CLI_ENABLE_SEND"), "{}", o.err);
+    assert!(o.err.contains("TEAMS_CLI_ENABLE_WRITES"), "{}", o.err);
 
     let o = teams_env(
         &h,
-        &["send", GROUP, "hello", "--yes"],
-        &[("TEAMS_CLI_ENABLE_SEND", "1"), ("TEAMS_CLI_SEND_ALLOWLIST", "48:notes")],
+        &["msg", "send", GROUP, "hello", "--yes"],
+        &[
+            ("TEAMS_CLI_ENABLE_WRITES", "1"),
+            ("TEAMS_CLI_WRITE_ALLOWLIST", "48:notes"),
+        ],
     );
     assert_eq!(o.code, 1, "{}", o.out);
     assert!(
-        o.err.contains("TEAMS_CLI_SEND_ALLOWLIST") || o.err.contains("allowlist"),
+        o.err.contains("TEAMS_CLI_WRITE_ALLOWLIST") || o.err.contains("allowlist"),
         "{}",
         o.err
     );
@@ -452,6 +467,9 @@ fn dynamic_completions_work_across_all_shells() {
     let root = teams(&h, &["__complete", "--shell", "fish", "--", ""]);
     assert_eq!(root.code, 0);
     assert!(root.out.contains("inbox\t"));
+    assert!(root.out.contains("message\t"));
+    assert!(root.out.contains("chat\t"));
+    assert!(root.out.contains("presence\t"));
     assert!(root.out.contains("daemon\t"));
     assert!(!root.out.contains("__complete"));
     assert!(root.out.trim_end().ends_with(":nofiles"));
@@ -459,13 +477,35 @@ fn dynamic_completions_work_across_all_shells() {
     let daemon_sub = teams(&h, &["__complete", "--shell", "zsh", "--", "daemon", ""]);
     assert!(daemon_sub.out.contains("install\t") && daemon_sub.out.contains("logs\t"));
 
+    let msg_sub = teams(&h, &["__complete", "--shell", "fish", "--", "message", ""]);
+    assert!(msg_sub.out.contains("send\t") && msg_sub.out.contains("react\t") && msg_sub.out.contains("edit\t"));
+
     let flags = teams(&h, &["__complete", "--shell", "fish", "--", "update", "--"]);
     assert!(flags.out.contains("--check\t"));
     assert!(!flags.out.contains("--background-check"));
 
-    let chats = teams(&h, &["__complete", "--shell", "fish", "--", "messages", ""]);
+    let chats = teams(&h, &["__complete", "--shell", "fish", "--", "message", "list", ""]);
     assert!(chats.out.contains("Launch crew\tchat,"), "{}", chats.out);
     assert!(chats.out.trim_end().ends_with(":nofiles"));
+
+    let send_chats = teams(&h, &["__complete", "--shell", "fish", "--", "message", "send", ""]);
+    assert!(send_chats.out.contains("Launch crew\tchat,"), "{}", send_chats.out);
+
+    let scopes = teams(
+        &h,
+        &[
+            "__complete",
+            "--shell",
+            "fish",
+            "--",
+            "token",
+            "create",
+            "bot",
+            "--scope",
+            "",
+        ],
+    );
+    assert!(scopes.out.contains("read\t") && scopes.out.contains("send\t") && scopes.out.contains("chat:manage\t"));
 
     let chats_bash = teams(&h, &["__complete", "--shell", "bash", "--", "search", "--chat=Lau"]);
     assert!(chats_bash.out.contains("--chat=Launch crew\n"), "{}", chats_bash.out);
@@ -500,12 +540,25 @@ fn dynamic_completions_work_across_all_shells() {
     );
     assert!(expires.out.contains("30d\t") && expires.out.contains("never\t"));
 
-    let kinds = teams(&h, &["__complete", "--shell", "fish", "--", "chats", "--kind", ""]);
+    let kinds = teams(
+        &h,
+        &["__complete", "--shell", "fish", "--", "chat", "list", "--kind", ""],
+    );
     assert!(kinds.out.contains("channel") && kinds.out.contains("meeting"));
 
     let out_flag = teams(
         &h,
-        &["__complete", "--shell", "fish", "--", "export", "Launch", "--out", ""],
+        &[
+            "__complete",
+            "--shell",
+            "fish",
+            "--",
+            "chat",
+            "export",
+            "Launch",
+            "--out",
+            "",
+        ],
     );
     assert!(out_flag.out.trim_end().ends_with(":files"));
 

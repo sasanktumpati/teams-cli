@@ -286,6 +286,57 @@ fn complete_expires() -> Vec<(String, String)> {
     .collect()
 }
 
+fn complete_presence_durations() -> Vec<(String, String)> {
+    [
+        ("15m", "15 minutes"),
+        ("30m", "30 minutes"),
+        ("1h", "1 hour"),
+        ("2h", "2 hours"),
+        ("4h", "4 hours"),
+        ("1d", "1 day"),
+        ("never", "Until changed"),
+    ]
+    .into_iter()
+    .map(|(k, d)| (k.to_string(), d.to_string()))
+    .collect()
+}
+
+fn complete_scopes() -> Vec<(String, String)> {
+    [
+        ("read", "Read local archive endpoints"),
+        ("sync", "Trigger archive sync"),
+        ("presence:read", "Read live presence"),
+        ("presence:write", "Set live availability and status message"),
+        ("react", "React, pin, save, and mute"),
+        ("mark-read", "Mark chats read/unread (sends read receipts)"),
+        ("send", "Send and forward messages with media"),
+        ("modify", "Edit and delete own messages"),
+        ("chat:manage", "Create/rename chats and manage members"),
+    ]
+    .into_iter()
+    .map(|(k, d)| (k.to_string(), d.to_string()))
+    .collect()
+}
+
+fn complete_reactions() -> Vec<(String, String)> {
+    [
+        ("like", "Thumbs up"),
+        ("heart", "Heart"),
+        ("laugh", "Laugh"),
+        ("surprised", "Surprised"),
+        ("sad", "Sad"),
+        ("angry", "Angry"),
+        ("1f389_partypopper", "Party popper"),
+        ("clappinghands", "Clapping hands"),
+        ("praying", "Thanks / praying"),
+        ("1f525_fire", "Fire"),
+        ("launch", "Rocket"),
+    ]
+    .into_iter()
+    .map(|(k, d)| (k.to_string(), d.to_string()))
+    .collect()
+}
+
 fn complete_versions() -> Vec<(String, String)> {
     let mut out = Vec::new();
     let cur_tag = format!("v{}", crate::VERSION);
@@ -356,17 +407,25 @@ fn complete_for_arg(path: &[String], arg: &Arg, current: &str, shell: &str) -> C
     let p0 = path.first().map(String::as_str).unwrap_or("");
     let p1 = path.get(1).map(String::as_str).unwrap_or("");
 
-    let (items, file_mode) = if long == Some("chat")
-        || (long.is_none() && matches!((p0, id), ("messages" | "export", "chat") | ("send", "target")))
+    let (items, file_mode) = if matches!(long, Some("chat" | "chats" | "from-chat"))
+        || (long.is_none() && (matches!(id, "chat" | "to_chat") || (p0 == "message" && p1 == "send" && id == "target")))
     {
         (complete_chats(), FileMode::NoFiles)
-    } else if matches!(long, Some("from" | "member" | "with")) || (long.is_none() && p0 == "people" && id == "person") {
+    } else if matches!(long, Some("from" | "member" | "with" | "mention"))
+        || (long.is_none() && matches!(id, "person" | "member" | "members"))
+    {
         (complete_people(), FileMode::NoFiles)
+    } else if long == Some("scope") {
+        (complete_scopes(), FileMode::NoFiles)
+    } else if long.is_none() && id == "reaction" {
+        (complete_reactions(), FileMode::NoFiles)
     } else if matches!(long, Some("since" | "until")) {
         (complete_times(), FileMode::NoFiles)
     } else if long == Some("expires") {
         (complete_expires(), FileMode::NoFiles)
-    } else if long == Some("type") && p0 == "attachments" {
+    } else if long == Some("for") {
+        (complete_presence_durations(), FileMode::NoFiles)
+    } else if long == Some("type") && p0 == "file" {
         (complete_file_types(), FileMode::NoFiles)
     } else if long == Some("version") && p0 == "update" {
         (complete_versions(), FileMode::NoFiles)
@@ -383,6 +442,29 @@ fn complete_for_arg(path: &[String], arg: &Arg, current: &str, shell: &str) -> C
             _ => (Vec::new(), FileMode::NoFiles),
         }
     };
+
+    if matches!(long, Some("scope" | "chats")) {
+        if let Some((prefix, tail)) = current.rsplit_once(',') {
+            let chosen: HashSet<String> = prefix
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let remaining: Vec<(String, String)> = items
+                .into_iter()
+                .filter(|(v, _)| !chosen.contains(&v.to_ascii_lowercase()))
+                .collect();
+            let filtered = filter_for_shell(remaining, tail, shell);
+            let prefixed: Vec<(String, String)> = filtered
+                .into_iter()
+                .map(|(v, d)| (format!("{prefix},{v}"), d))
+                .collect();
+            return CompletionResult {
+                items: prefixed,
+                file_mode,
+            };
+        }
+    }
 
     CompletionResult {
         items: filter_for_shell(items, current, shell),
@@ -492,7 +574,7 @@ pub fn complete_argv(root: &Command, words: &[String], shell: &str) -> Completio
         if pos_count == 0 {
             if let Some(sub) = visible_subcommands(cur_cmd)
                 .into_iter()
-                .find(|s| s.get_name() == tok.as_str())
+                .find(|s| s.get_name() == tok.as_str() || s.get_all_aliases().any(|a| a == tok.as_str()))
             {
                 cur_cmd = sub;
                 path.push(sub.get_name().to_string());
@@ -549,7 +631,13 @@ pub fn complete_argv(root: &Command, words: &[String], shell: &str) -> Completio
         .get_arguments()
         .filter(|a| a.is_positional() && !a.is_hide_set())
         .collect();
-    if let Some(arg) = positionals.get(pos_count) {
+    let pos_arg = positionals.get(pos_count).copied().or_else(|| {
+        positionals
+            .last()
+            .copied()
+            .filter(|a| arg_is_repeatable(a) || a.get_num_args().is_some_and(|r| r.max_values() > 1))
+    });
+    if let Some(arg) = pos_arg {
         return complete_for_arg(&path, arg, current, shell);
     }
 

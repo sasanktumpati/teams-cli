@@ -1,5 +1,5 @@
 use crate::launchd;
-use crate::live::http;
+use crate::live::transport;
 use crate::paths;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -151,7 +151,7 @@ fn fetch_bytes(url: &str, accept: Option<&str>, max_bytes: u64, allow_loopback_h
         accept,
         max_bytes,
         allow_loopback_http,
-        http::CONNECT_TIMEOUT,
+        transport::CONNECT_TIMEOUT,
         Duration::from_secs(60),
     )
 }
@@ -164,7 +164,7 @@ fn fetch_bytes_with_timeouts(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let agent = http::agent_with_timeouts(connect_timeout, read_timeout);
+    let agent = transport::agent_with_timeouts(connect_timeout, read_timeout);
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         if !is_trusted_release_url(&current, allow_loopback_http) {

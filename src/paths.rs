@@ -71,6 +71,10 @@ pub fn api_tokens_path() -> PathBuf {
     home().join("api.tokens.json")
 }
 
+pub fn write_audit_log_path() -> PathBuf {
+    home().join("write-audit.jsonl")
+}
+
 pub fn lock_path() -> PathBuf {
     home().join("sync.lock")
 }

@@ -193,20 +193,32 @@ pub fn encode_record(data: &Value) -> Vec<u8> {
 }
 
 pub fn decode_record_bytes(raw: &[u8]) -> Result<Value, String> {
+    let mut scratch = Vec::new();
+    decode_record_bytes_into(raw, &mut scratch)
+}
+
+pub fn decode_record_bytes_into<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<T, String> {
+    scratch.clear();
     let mut dec = ZlibDecoder::new(raw);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out).map_err(|e| format!("zlib: {e}"))?;
-    let s = String::from_utf8(out).map_err(|e| format!("utf8: {e}"))?;
-    serde_json::from_str(&s).map_err(|e| format!("json: {e}"))
+    dec.read_to_end(scratch).map_err(|e| format!("zlib: {e}"))?;
+    serde_json::from_slice(scratch).map_err(|e| format!("json: {e}"))
 }
 
 pub fn decode_record_ref(val: rusqlite::types::ValueRef<'_>) -> Result<Value, String> {
+    let mut scratch = Vec::new();
+    decode_record_ref_into(val, &mut scratch)
+}
+
+pub fn decode_record_ref_into<T: serde::de::DeserializeOwned>(
+    val: rusqlite::types::ValueRef<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<T, String> {
     match val {
-        rusqlite::types::ValueRef::Blob(b) => decode_record_bytes(b),
-        rusqlite::types::ValueRef::Text(t) => {
-            let s = std::str::from_utf8(t).map_err(|e| format!("utf8: {e}"))?;
-            serde_json::from_str(s).map_err(|e| format!("json: {e}"))
-        }
+        rusqlite::types::ValueRef::Blob(b) => decode_record_bytes_into(b, scratch),
+        rusqlite::types::ValueRef::Text(t) => serde_json::from_slice(t).map_err(|e| format!("json: {e}")),
         other => Err(format!("unexpected record data type {:?}", other.data_type())),
     }
 }

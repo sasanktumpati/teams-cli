@@ -23,8 +23,8 @@ fn teams_cmd(home: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_teams"));
     cmd.args(args)
         .env("TEAMS_CLI_HOME", home)
-        .env_remove("TEAMS_CLI_ENABLE_SEND")
-        .env_remove("TEAMS_CLI_SEND_ALLOWLIST")
+        .env_remove("TEAMS_CLI_ENABLE_WRITES")
+        .env_remove("TEAMS_CLI_WRITE_ALLOWLIST")
         .env("TEAMS_CLI_SOURCE", home.join("no-teams-cache"))
         .env("HOME", home)
         .env("TZ", "UTC");
@@ -98,7 +98,7 @@ fn cli_read_commands_without_an_archive_error_cleanly_and_create_nothing() {
     for argv in [
         vec!["status"],
         vec!["status", "--json"],
-        vec!["chats"],
+        vec!["chat", "list"],
         vec!["search", "hello"],
         vec!["inbox"],
     ] {
@@ -747,7 +747,7 @@ fn restore_yes_restores_an_xz_backup_and_rejects_bad_ones() {
     );
     assert_eq!(o.code, 0, "{} / {}", o.out, o.err);
     assert!(o.out.contains("Restored"), "{}", o.out);
-    let o = teams(&h, &["chats"]);
+    let o = teams(&h, &["chat", "list"]);
     assert_eq!(o.code, 0, "{}", o.err);
     assert!(o.out.contains("Launch crew"));
 
@@ -767,7 +767,7 @@ fn restore_yes_restores_an_xz_backup_and_rejects_bad_ones() {
     let o = teams(&h, &["archive", "restore", bad.to_str().unwrap(), "--yes"]);
     assert_eq!(o.code, 1);
     assert!(o.err.contains("failed verification"), "{}", o.err);
-    assert_eq!(teams(&h, &["chats"]).code, 0);
+    assert_eq!(teams(&h, &["chat", "list"]).code, 0);
 }
 
 #[test]

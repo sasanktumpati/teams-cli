@@ -1,5 +1,5 @@
 use crate::formatters::Quoted;
-use crate::live::{auth, onedrive};
+use crate::live::{cookies, local_onedrive, transport};
 use crate::paths;
 use crate::storage::db;
 use regex::Regex;
@@ -324,7 +324,7 @@ fn extension_for_content_type(ct: &str) -> &'static str {
 fn parse_cd_filename(header: Option<&str>) -> Option<String> {
     let h = header?;
     if let Some(cap) = RFC5987_RE.captures(h) {
-        let v = auth::urlencoding_decode(cap[1].trim().trim_matches('"'));
+        let v = cookies::urlencoding_decode(cap[1].trim().trim_matches('"'));
         if !v.is_empty() {
             return Some(v);
         }
@@ -346,7 +346,7 @@ fn url_basename_candidate(url_str: &str) -> Option<String> {
     if SHAREPOINT_SHARING_RE.is_match(u.path()) {
         return None;
     }
-    let seg = auth::urlencoding_decode(u.path().trim_end_matches('/').rsplit('/').next()?);
+    let seg = cookies::urlencoding_decode(u.path().trim_end_matches('/').rsplit('/').next()?);
     if seg.is_empty() || matches!(seg.as_str(), "imgo" | "imgpsh_fullsize_anim" | "download.aspx") || !seg.contains('.')
     {
         return None;
@@ -579,7 +579,7 @@ pub fn fetch_attachment_with_limit(
     if att.kind == "file" && !force_download {
         let lookup = att.name.clone().or_else(|| url_basename_candidate(&att.url));
         if let Some(lname) = lookup {
-            if let Some(od_path) = onedrive::find_onedrive_file(&lname, None) {
+            if let Some(od_path) = local_onedrive::find_onedrive_file(&lname, None) {
                 let fname = od_path.file_name().unwrap().to_string_lossy().into_owned();
                 let ct = guess_content_type(&fname);
                 if out.is_none() {
@@ -619,13 +619,13 @@ pub fn fetch_attachment_with_limit(
         }
     }
 
-    let cookies = if auth::is_trusted_url(&att.url) {
-        auth::load_cookies(None, None, None).map_err(|e| FetchError(e.to_string()))?
+    let cookies = if cookies::is_trusted_url(&att.url) {
+        cookies::load_cookies(None, None, None).map_err(|e| FetchError(e.to_string()))?
     } else {
         Vec::new()
     };
 
-    let agent = crate::live::http::agent(crate::live::http::READ_TIMEOUT);
+    let agent = transport::agent(transport::READ_TIMEOUT);
 
     let mut current_url = rewrite_download_url(&att.url);
     let mut final_resp = None;
@@ -638,15 +638,15 @@ pub fn fetch_attachment_with_limit(
                 Quoted(parsed.scheme())
             )));
         }
-        if auth::is_login_host(parsed.host_str()) {
+        if cookies::is_login_host(parsed.host_str()) {
             return Err(FetchError(
                 "Teams session cookies have expired (redirected to Microsoft login). \
                  Open Microsoft Teams to refresh your session, then try again."
                     .to_string(),
             ));
         }
-        let mut req = agent.get(&current_url).set("User-Agent", auth::USER_AGENT);
-        let hdr = auth::build_cookie_header(&cookies, &current_url, None);
+        let mut req = agent.get(&current_url).set("User-Agent", cookies::USER_AGENT);
+        let hdr = cookies::build_cookie_header(&cookies, &current_url, None);
         if !hdr.is_empty() {
             req = req.set("Cookie", &hdr);
         }

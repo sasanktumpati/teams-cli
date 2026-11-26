@@ -5,26 +5,71 @@ use crate::formatters::{self as fmt, Quoted};
 use crate::ingest::{indexeddb::TeamsCache, sync};
 use crate::json_codec;
 use crate::launchd;
-use crate::live::{fetch, send};
+use crate::live::clients::{ams, sharepoint};
+use crate::live::compose::{self, BodyFormat, Importance};
+use crate::live::error::LiveError;
+use crate::live::fetch;
+use crate::live::policy::{self, Principal, Scope};
+use crate::live::service::chats::{ChatStateRequest, CreateChatRequest, MemberChangeRequest, RenameChatRequest};
+use crate::live::service::messages::{
+    EditMessageRequest, ForwardMessageRequest, MediaUpload, MessageActionRequest, ReactMessageRequest,
+    SendMessageRequest,
+};
+use crate::live::service::{ArchiveSource, LiveService};
+use crate::live::session;
 use crate::paths;
+use crate::query::resolve::{self, Strictness};
 use crate::query::{api, export, views};
 use crate::storage::{archive, backups, migrations};
 use crate::timeutil::{iso, short};
 use crate::update;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
+use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
 pub const VERSION: &str = crate::VERSION;
 pub const MIN_SYNC_INTERVAL: u64 = 10;
 
+#[derive(Args, Debug, Clone)]
+pub struct TimeRangeArgs {
+    #[arg(long, help = "Only items at or after this time (e.g. 7d, today, 2026-11-01)")]
+    pub since: Option<String>,
+    #[arg(long, help = "Only items before this time")]
+    pub until: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WriteConfirmArgs {
+    #[arg(long, help = "Preview the request without executing")]
+    pub dry_run: bool,
+    #[arg(long, help = "Execute the live action (also requires TEAMS_CLI_ENABLE_WRITES=1)")]
+    pub yes: bool,
+    #[arg(long, help = "Output as JSON")]
+    pub json: bool,
+}
+
+impl WriteConfirmArgs {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || !self.yes
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LightWriteArgs {
+    #[arg(long, help = "Preview the request without executing")]
+    pub dry_run: bool,
+    #[arg(long, help = "Output as JSON")]
+    pub json: bool,
+}
+
 #[derive(Parser)]
 #[command(
     name = "teams",
     display_name = "teams-cli",
     version = VERSION,
-    about = "Durable local archive of your Microsoft Teams chats."
+    about = "Durable local archive, CLI, and scoped HTTP API for Microsoft Teams."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -53,70 +98,6 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "List chats, channels and meetings by recent activity")]
-    Chats {
-        #[arg(long, help = "Filter chats by name fragment or exact conversation id")]
-        grep: Option<String>,
-        #[arg(
-            long,
-            value_parser = ["chat", "channel", "meeting", "team", "community", "system"],
-            help = "Filter by conversation kind"
-        )]
-        kind: Option<String>,
-        #[arg(long, help = "Include system feeds (notifications, call logs, notes)")]
-        all: bool,
-        #[arg(long, help = "Filter to chats that include this person (name, email, or id)")]
-        member: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 40,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum chats to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Read a chat (by name or id), or the messages around one message")]
-    Messages {
-        #[arg(help = "Chat name fragment or conversation id")]
-        chat: Option<String>,
-        #[arg(long, help = "Message id (or chatId/msgId) to inspect with surrounding context")]
-        around: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 10,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Number of messages before and after `--around`"
-        )]
-        context: usize,
-        #[arg(long, help = "Filter to a single channel thread root message id")]
-        thread: Option<String>,
-        #[arg(long, help = "Include earlier versions of edited messages")]
-        history: bool,
-        #[arg(long, help = "Only messages at or after this time (e.g. 7d, today, 2026-11-01)")]
-        since: Option<String>,
-        #[arg(long, help = "Only messages before this time")]
-        until: Option<String>,
-        #[arg(long = "from", help = "Only messages sent by this person (name, email, or id)")]
-        sender: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 100,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum messages to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Include system events (joins, renames, calls, recordings)")]
-        events: bool,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
     #[command(about = "Full-text search across every archived message")]
     Search {
         #[arg(help = "Search words, \"exact phrase\", OR, NOT, or -exclude")]
@@ -129,15 +110,13 @@ pub enum Commands {
         )]
         relevance: bool,
         #[arg(long, help = "Also match wording later edited out of messages")]
-        include_history: bool,
+        history: bool,
         #[arg(long, help = "Return only the match count")]
         count: bool,
         #[arg(long, help = "Only messages that have at least one file, image, or link attachment")]
         has_attachments: bool,
-        #[arg(long, help = "Only messages at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only messages before this time")]
-        until: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         #[arg(long = "from", help = "Limit to one sender (name, email, or id)")]
         sender: Option<String>,
         #[arg(
@@ -156,10 +135,8 @@ pub enum Commands {
 
     #[command(about = "Messages that @mention you, newest first")]
     Mentions {
-        #[arg(long, help = "Only mentions at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only mentions before this time")]
-        until: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         #[arg(long, help = "Limit to one chat (name fragment or id)")]
         chat: Option<String>,
         #[arg(long, help = "Show only mentions marked unread in Teams")]
@@ -204,32 +181,25 @@ pub enum Commands {
         json: bool,
     },
 
-    #[command(about = "Files, images and links shared in messages, with their links")]
-    Attachments {
-        #[arg(help = "Filter by file name or URL substring")]
-        query: Vec<String>,
-        #[arg(long, help = "Limit to one chat (name fragment or id)")]
-        chat: Option<String>,
-        #[arg(long, value_parser = ["file", "image", "link"], help = "Filter by attachment kind")]
-        kind: Option<String>,
-        #[arg(long = "type", help = "Filter files by extension (e.g. pdf, xlsx, zip)")]
-        file_type: Option<String>,
-        #[arg(long, help = "Only attachments shared at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only attachments shared before this time")]
-        until: Option<String>,
-        #[arg(long = "from", help = "Limit to one sender (name, email, or id)")]
-        sender: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum attachments to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
+    #[command(about = "List, export, create, rename, manage members, read/unread, or mute chats")]
+    Chat {
+        #[command(subcommand)]
+        action: ChatAction,
+    },
+
+    #[command(
+        visible_alias = "msg",
+        about = "Read, send, edit, delete, react, pin, save, or forward messages"
+    )]
+    Message {
+        #[command(subcommand)]
+        action: MessageAction,
+    },
+
+    #[command(about = "List and download shared files, images, and links")]
+    File {
+        #[command(subcommand)]
+        action: FileAction,
     },
 
     #[command(about = "List people seen in Teams, or inspect one person by name, email, or id")]
@@ -255,12 +225,18 @@ pub enum Commands {
         json: bool,
     },
 
+    #[command(about = "Check live presence, set availability, or update your Teams status message")]
+    Presence {
+        #[command(subcommand)]
+        action: Option<PresenceAction>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+
     #[command(about = "Call history with direction, state, duration and participants")]
     Calls {
-        #[arg(long, help = "Only calls at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only calls before this time")]
-        until: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         #[arg(long = "with", help = "Filter to calls involving this person (name, email, or id)")]
         person: Option<String>,
         #[arg(long, help = "Show only missed calls")]
@@ -279,10 +255,8 @@ pub enum Commands {
 
     #[command(about = "Calendar meetings Teams cached, newest start first")]
     Meetings {
-        #[arg(long, help = "Only meetings ending at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only meetings starting before this time")]
-        until: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
         #[arg(long, help = "Filter by subject, organizer, location, or attendee substring")]
         grep: Option<String>,
         #[arg(
@@ -293,110 +267,6 @@ pub enum Commands {
             help = "Maximum meetings to return (0 = all)"
         )]
         limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Messages you saved (bookmarked), most recently saved first")]
-    Saved {
-        #[arg(long, help = "Include messages you later unsaved")]
-        all: bool,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum saved messages to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Messages pinned in chats and channels")]
-    Pinned {
-        #[arg(long, help = "Limit to one chat (name fragment or id)")]
-        chat: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 50,
-            value_parser = nonneg_int,
-            allow_negative_numbers = true,
-            help = "Maximum pinned messages to return (0 = all)"
-        )]
-        limit: usize,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "Export a chat as Markdown (whole history by default)")]
-    Export {
-        #[arg(help = "Chat name fragment or conversation id")]
-        chat: String,
-        #[arg(long, help = "Only messages at or after this time")]
-        since: Option<String>,
-        #[arg(long, help = "Only messages before this time")]
-        until: Option<String>,
-        #[arg(long = "from", help = "Only messages from this sender")]
-        sender: Option<String>,
-        #[arg(long, help = "Export a single channel thread root message id")]
-        thread: Option<String>,
-        #[arg(long, help = "Include system events")]
-        events: bool,
-        #[arg(long, help = "Include earlier versions under edited messages")]
-        history: bool,
-        #[arg(
-            long,
-            value_hint = clap::ValueHint::FilePath,
-            help = "Write Markdown to this file (mode 0600) instead of stdout"
-        )]
-        out: Option<String>,
-    },
-
-    #[command(about = "Download a shared file or pasted image on demand (CLI only)")]
-    Fetch {
-        #[arg(help = "Attachment URL, message id, or filename query")]
-        target: Vec<String>,
-        #[arg(long, help = "Message id (or chatId/msgId) owning the attachment")]
-        message: Option<String>,
-        #[arg(long, help = "1-based attachment index when a message or query has multiple matches")]
-        index: Option<usize>,
-        #[arg(
-            long,
-            value_hint = clap::ValueHint::AnyPath,
-            help = "Destination file or directory path"
-        )]
-        out: Option<String>,
-        #[arg(long, help = "Download from Microsoft even if a local OneDrive copy exists")]
-        force_download: bool,
-        #[arg(
-            long,
-            default_value_t = fetch::DEFAULT_MAX_BYTES,
-            help = "Maximum allowed download size in bytes (default 2 GiB, 0 = unlimited)"
-        )]
-        max_bytes: u64,
-        #[arg(long, help = "Output as JSON")]
-        json: bool,
-    },
-
-    #[command(about = "[RESTRICTED] Send a Teams message (CLI only; dry run unless --yes & TEAMS_CLI_ENABLE_SEND=1)")]
-    Send {
-        #[arg(help = "Target conversation id or unambiguous chat name")]
-        target: String,
-        #[arg(help = "Message body text")]
-        message: Vec<String>,
-        #[arg(long, help = "Read message body from stdin")]
-        stdin: bool,
-        #[arg(long, help = "Reply to a numeric channel thread root message id")]
-        reply_to: Option<String>,
-        #[arg(long, help = "Send body as raw HTML instead of escaping plain text")]
-        html: bool,
-        #[arg(long, help = "Explicit numeric client message id (1–32 digits)")]
-        client_message_id: Option<String>,
-        #[arg(long, help = "Preview the request without sending")]
-        dry_run: bool,
-        #[arg(long, help = "Actually send the message (also requires TEAMS_CLI_ENABLE_SEND=1)")]
-        yes: bool,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -441,7 +311,7 @@ pub enum Commands {
         action: ArchiveAction,
     },
 
-    #[command(about = "Manage named HTTP API bearer tokens (SHA-256 hashed; secret shown once)")]
+    #[command(about = "Manage scoped HTTP API bearer tokens (SHA-256 hashed; secret shown once)")]
     Token {
         #[command(subcommand)]
         action: TokenAction,
@@ -495,93 +365,461 @@ pub enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateNoticeMode {
-    None,
-    CheckOnly,
-    Full,
+#[derive(Subcommand)]
+pub enum ChatAction {
+    #[command(about = "List chats, channels and meetings by recent activity")]
+    List {
+        #[arg(long, help = "Filter chats by name fragment or exact conversation id")]
+        grep: Option<String>,
+        #[arg(
+            long,
+            value_parser = ["chat", "channel", "meeting", "team", "community", "system"],
+            help = "Filter by conversation kind"
+        )]
+        kind: Option<String>,
+        #[arg(long, help = "Include system feeds (notifications, call logs, notes)")]
+        all: bool,
+        #[arg(long, help = "Filter to chats that include this person (name, email, or id)")]
+        member: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 40,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum chats to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Export a chat as Markdown (whole history by default)")]
+    Export {
+        #[arg(help = "Chat name fragment or conversation id")]
+        chat: String,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        #[arg(long = "from", help = "Only messages from this sender")]
+        sender: Option<String>,
+        #[arg(long, help = "Export a single channel thread root message id")]
+        thread: Option<String>,
+        #[arg(long, help = "Include system events")]
+        events: bool,
+        #[arg(long, help = "Include earlier versions under edited messages")]
+        history: bool,
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            help = "Write Markdown to this file (mode 0600) instead of stdout"
+        )]
+        out: Option<String>,
+    },
+    #[command(about = "[LIVE] Start a new 1:1 or group chat")]
+    New {
+        #[arg(required = true, help = "People to include (name, email, or MRI)")]
+        members: Vec<String>,
+        #[arg(long, help = "Optional group chat topic")]
+        topic: Option<String>,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Rename a group chat topic")]
+    Rename {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[arg(help = "New chat topic")]
+        topic: String,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Add a member to a group chat")]
+    AddMember {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[arg(help = "Person to add (name, email, or MRI)")]
+        member: String,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Remove a member from a group chat")]
+    RemoveMember {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[arg(help = "Person to remove (name, email, or MRI)")]
+        member: String,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Mark a chat as read in Teams")]
+    Read {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Mark a chat as unread in Teams")]
+    Unread {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Mute notifications for a chat")]
+    Mute {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Unmute notifications for a chat")]
+    Unmute {
+        #[arg(help = "Chat name or conversation id")]
+        chat: String,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
 }
 
-impl Commands {
-    pub fn update_notice_mode(&self) -> UpdateNoticeMode {
-        match self {
-            Commands::Docs
-            | Commands::Complete { .. }
-            | Commands::Completions { .. }
-            | Commands::Debug { .. }
-            | Commands::Token { .. }
-            | Commands::Export { .. }
-            | Commands::Update { .. }
-            | Commands::Daemon {
-                action: DaemonAction::Run { .. } | DaemonAction::Status | DaemonAction::Logs { follow: true, .. },
-            } => UpdateNoticeMode::None,
-            Commands::Sync { json, notify, .. } => {
-                if *json || *notify {
-                    UpdateNoticeMode::None
-                } else {
-                    UpdateNoticeMode::Full
-                }
-            }
-            Commands::Status { json } => {
-                if *json {
-                    UpdateNoticeMode::None
-                } else {
-                    UpdateNoticeMode::CheckOnly
-                }
-            }
-            Commands::Archive {
-                action:
-                    ArchiveAction::Verify { json, .. }
-                    | ArchiveAction::Restore { json, .. }
-                    | ArchiveAction::Migrations { json },
-            } => {
-                if *json {
-                    UpdateNoticeMode::None
-                } else {
-                    UpdateNoticeMode::Full
-                }
-            }
-            Commands::Doctor { json }
-            | Commands::Chats { json, .. }
-            | Commands::Messages { json, .. }
-            | Commands::Changes { json, .. }
-            | Commands::Search { json, .. }
-            | Commands::Attachments { json, .. }
-            | Commands::Fetch { json, .. }
-            | Commands::Send { json, .. }
-            | Commands::People { json, .. }
-            | Commands::Inbox { json, .. }
-            | Commands::Mentions { json, .. }
-            | Commands::Calls { json, .. }
-            | Commands::Meetings { json, .. }
-            | Commands::Saved { json, .. }
-            | Commands::Pinned { json, .. } => {
-                if *json {
-                    UpdateNoticeMode::None
-                } else {
-                    UpdateNoticeMode::Full
-                }
-            }
-            Commands::Archive {
-                action: ArchiveAction::Backup { .. } | ArchiveAction::Reindex,
-            }
-            | Commands::Daemon { .. } => UpdateNoticeMode::Full,
-        }
-    }
+#[derive(Subcommand)]
+pub enum MessageAction {
+    #[command(about = "Read archived messages in a chat, or around one message")]
+    List {
+        #[arg(help = "Chat name fragment or conversation id")]
+        chat: Option<String>,
+        #[arg(long, help = "Message id (or chatId/msgId) to inspect with surrounding context")]
+        around: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 10,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Number of messages before and after `--around`"
+        )]
+        context: usize,
+        #[arg(long, help = "Filter to a single channel thread root message id")]
+        thread: Option<String>,
+        #[arg(long, help = "Include earlier versions of edited messages")]
+        history: bool,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        #[arg(long = "from", help = "Only messages sent by this person (name, email, or id)")]
+        sender: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 100,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum messages to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Include system events (joins, renames, calls, recordings)")]
+        events: bool,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Messages you saved (bookmarked), most recently saved first")]
+    Saved {
+        #[arg(long, help = "Include messages you later unsaved")]
+        include_unsaved: bool,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum saved messages to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Messages pinned in chats and channels")]
+    Pinned {
+        #[arg(long, help = "Limit to one chat (name fragment or id)")]
+        chat: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum pinned messages to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "[LIVE] Send a message with optional Markdown, @mentions, quote, images, or files")]
+    Send {
+        #[arg(help = "Target conversation id or unambiguous chat name")]
+        target: String,
+        #[arg(help = "Message body text")]
+        message: Vec<String>,
+        #[arg(long, help = "Read message body from stdin")]
+        stdin: bool,
+        #[arg(long, help = "Reply to a numeric channel thread root message id")]
+        reply_to: Option<String>,
+        #[arg(long, help = "Quote an existing message (msgId or chatId/msgId)")]
+        quote: Option<String>,
+        #[arg(long, help = "Optional post subject line")]
+        subject: Option<String>,
+        #[arg(long, conflicts_with = "urgent", help = "Mark message as important")]
+        important: bool,
+        #[arg(long, conflicts_with = "important", help = "Mark message as urgent")]
+        urgent: bool,
+        #[arg(long, conflicts_with = "html", help = "Render body from Markdown to Teams HTML")]
+        markdown: bool,
+        #[arg(
+            long,
+            conflicts_with = "markdown",
+            help = "Send body as raw HTML instead of escaping"
+        )]
+        html: bool,
+        #[arg(long, help = "Real @mention for a person (repeatable; name, email, or MRI)")]
+        mention: Vec<String>,
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            help = "Upload and embed an inline image/GIF (repeatable)"
+        )]
+        image: Vec<PathBuf>,
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::FilePath,
+            help = "Upload to OneDrive/SharePoint and attach a file (repeatable)"
+        )]
+        file: Vec<PathBuf>,
+        #[arg(long, help = "Explicit numeric client message id (1–32 digits)")]
+        client_message_id: Option<String>,
+        #[arg(long, help = "Idempotency key hashed to a stable client message id")]
+        idempotency_key: Option<String>,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Edit one of your sent messages")]
+    Edit {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(help = "Replacement message text")]
+        text: Vec<String>,
+        #[arg(long, help = "Chat name or id (optional when msgId is unique or chatId/msgId)")]
+        chat: Option<String>,
+        #[arg(long, help = "Read replacement body from stdin")]
+        stdin: bool,
+        #[arg(long, conflicts_with = "html", help = "Render body from Markdown")]
+        markdown: bool,
+        #[arg(long, conflicts_with = "markdown", help = "Send body as raw HTML")]
+        html: bool,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Delete one of your sent messages")]
+    Delete {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+    #[command(about = "[LIVE] Add a reaction to a message")]
+    React {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(help = "Emoji or Teams key (e.g. 👍, ❤️, like, heart, 1f389_partypopper)")]
+        reaction: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Remove a reaction from a message")]
+    Unreact {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(help = "Emoji or Teams key to remove")]
+        reaction: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Pin a message in its chat or channel")]
+    Pin {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Unpin a message")]
+    Unpin {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Save (bookmark) a message")]
+    Save {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Unsave a bookmarked message")]
+    Unsave {
+        #[arg(help = "Message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(long, help = "Chat name or id")]
+        chat: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Forward an existing message to another chat")]
+    Forward {
+        #[arg(help = "Source message id (msgId or chatId/msgId)")]
+        message: String,
+        #[arg(help = "Destination chat name or conversation id")]
+        to_chat: String,
+        #[arg(long, help = "Source chat name or id")]
+        from_chat: Option<String>,
+        #[arg(long, help = "Optional comment above the forwarded message")]
+        comment: Option<String>,
+        #[arg(long, help = "Render comment from Markdown")]
+        markdown: bool,
+        #[arg(long, help = "Idempotency key hashed to a stable client message id")]
+        idempotency_key: Option<String>,
+        #[command(flatten)]
+        write: WriteConfirmArgs,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FileAction {
+    #[command(about = "List files, images and links shared in messages")]
+    List {
+        #[arg(help = "Filter by file name or URL substring")]
+        query: Vec<String>,
+        #[arg(long, help = "Limit to one chat (name fragment or id)")]
+        chat: Option<String>,
+        #[arg(long, value_parser = ["file", "image", "link"], help = "Filter by attachment kind")]
+        kind: Option<String>,
+        #[arg(long = "type", help = "Filter files by extension (e.g. pdf, xlsx, zip)")]
+        file_type: Option<String>,
+        #[command(flatten)]
+        time: TimeRangeArgs,
+        #[arg(long = "from", help = "Limit to one sender (name, email, or id)")]
+        sender: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 50,
+            value_parser = nonneg_int,
+            allow_negative_numbers = true,
+            help = "Maximum files to return (0 = all)"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Download a shared file or pasted image on demand")]
+    Fetch {
+        #[arg(help = "Attachment URL, message id, or filename query")]
+        target: Vec<String>,
+        #[arg(long, help = "Message id (or chatId/msgId) owning the attachment")]
+        message: Option<String>,
+        #[arg(long, help = "1-based attachment index when a message or query has multiple matches")]
+        index: Option<usize>,
+        #[arg(
+            long,
+            value_hint = clap::ValueHint::AnyPath,
+            help = "Destination file or directory path"
+        )]
+        out: Option<String>,
+        #[arg(long, help = "Download from Microsoft even if a local OneDrive copy exists")]
+        force_download: bool,
+        #[arg(
+            long,
+            default_value_t = fetch::DEFAULT_MAX_BYTES,
+            help = "Maximum allowed download size in bytes (default 2 GiB, 0 = unlimited)"
+        )]
+        max_bytes: u64,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PresenceAction {
+    #[command(about = "[LIVE] Get your own live presence or look up people")]
+    Get {
+        #[arg(help = "Optional people (name, email, or MRI); omit for your own presence")]
+        person: Vec<String>,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "[LIVE] Set your availability (available, busy, dnd, brb, away, offline, reset)")]
+    Set {
+        #[arg(
+            value_parser = ["available", "busy", "dnd", "brb", "away", "offline", "reset"],
+            help = "Target availability"
+        )]
+        availability: String,
+        #[arg(long = "for", help = "Optional duration or expiry (e.g. 30m, 2h, 1d)")]
+        expires: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Set or clear your Teams status message")]
+    Message {
+        #[command(subcommand)]
+        action: PresenceMessageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PresenceMessageAction {
+    #[command(about = "[LIVE] Publish a status message")]
+    Set {
+        #[arg(required = true, help = "Status message text")]
+        message: Vec<String>,
+        #[arg(long = "for", help = "Optional expiry (e.g. 1h, 4h, 1d)")]
+        expires: Option<String>,
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
+    #[command(about = "[LIVE] Clear your status message")]
+    Clear {
+        #[command(flatten)]
+        flags: LightWriteArgs,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum TokenAction {
-    #[command(about = "Create a named bearer token (stored SHA-256 hashed; secret printed once)")]
+    #[command(about = "Create a scoped named bearer token (stored SHA-256 hashed; secret printed once)")]
     Create {
-        #[arg(help = "Human-readable label for the token (e.g. executor, ci, script)")]
+        #[arg(help = "Human-readable label for the token (e.g. executor, ci, bot)")]
         name: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated scopes (default: read). Options: read, sync, presence:read, presence:write, react, mark-read, send, modify, chat:manage"
+        )]
+        scope: Vec<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Restrict live actions for this token to these chats (resolved to exact conversation ids)"
+        )]
+        chats: Vec<String>,
         #[arg(long, help = "Optional expiry (e.g. 12h, 7d, 30d, 1y, 2027-01-01, or never)")]
         expires: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
-    #[command(about = "List named bearer tokens (metadata only; secrets are never shown)")]
+    #[command(about = "List named bearer tokens (metadata and scopes only; secrets are never shown)")]
     List {
         #[arg(long, help = "Also show expired tokens")]
         include_expired: bool,
@@ -615,6 +853,11 @@ pub enum DaemonAction {
         interval: u64,
         #[arg(long, help = "Loopback HTTP port (default 47613 or TEAMS_CLI_PORT)")]
         port: Option<u16>,
+        #[arg(
+            long,
+            help = "Enable scoped live write routes on the HTTP API (runs an interactive Keychain check)"
+        )]
+        allow_writes: bool,
     },
     #[command(about = "Stop and remove the launchd background daemon")]
     Uninstall,
@@ -647,8 +890,10 @@ pub enum DaemonAction {
             help = "Seconds between lightweight cache refresh checks (minimum 10)"
         )]
         interval: u64,
-        #[arg(long, help = "Serve the read-only HTTP API without periodic syncing")]
+        #[arg(long, help = "Serve the HTTP API without periodic syncing")]
         no_sync: bool,
+        #[arg(long, help = "Enable scoped live write routes on the HTTP API")]
+        allow_writes: bool,
         #[arg(
             long = "log-stderr",
             alias = "foreground",
@@ -741,14 +986,141 @@ pub enum DebugAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateNoticeMode {
+    None,
+    CheckOnly,
+    Full,
+}
+
+impl Commands {
+    pub fn is_json_output(&self) -> bool {
+        match self {
+            Commands::Inbox { json, .. }
+            | Commands::Search { json, .. }
+            | Commands::Mentions { json, .. }
+            | Commands::Changes { json, .. }
+            | Commands::People { json, .. }
+            | Commands::Calls { json, .. }
+            | Commands::Meetings { json, .. }
+            | Commands::Sync { json, .. }
+            | Commands::Status { json }
+            | Commands::Doctor { json }
+            | Commands::Update { json, .. } => *json,
+            Commands::Presence { action, json } => match action {
+                None => *json,
+                Some(PresenceAction::Get { json: gj, .. }) => *gj || *json,
+                Some(PresenceAction::Set { flags, .. }) => flags.json || *json,
+                Some(PresenceAction::Message { action: ma }) => match ma {
+                    PresenceMessageAction::Set { flags, .. } | PresenceMessageAction::Clear { flags } => {
+                        flags.json || *json
+                    }
+                },
+            },
+            Commands::Chat { action } => match action {
+                ChatAction::List { json, .. } => *json,
+                ChatAction::Export { .. } => false,
+                ChatAction::New { write, .. }
+                | ChatAction::Rename { write, .. }
+                | ChatAction::AddMember { write, .. }
+                | ChatAction::RemoveMember { write, .. } => write.json,
+                ChatAction::Read { flags, .. }
+                | ChatAction::Unread { flags, .. }
+                | ChatAction::Mute { flags, .. }
+                | ChatAction::Unmute { flags, .. } => flags.json,
+            },
+            Commands::Message { action } => match action {
+                MessageAction::List { json, .. }
+                | MessageAction::Saved { json, .. }
+                | MessageAction::Pinned { json, .. } => *json,
+                MessageAction::Send { write, .. }
+                | MessageAction::Edit { write, .. }
+                | MessageAction::Delete { write, .. }
+                | MessageAction::Forward { write, .. } => write.json,
+                MessageAction::React { flags, .. }
+                | MessageAction::Unreact { flags, .. }
+                | MessageAction::Pin { flags, .. }
+                | MessageAction::Unpin { flags, .. }
+                | MessageAction::Save { flags, .. }
+                | MessageAction::Unsave { flags, .. } => flags.json,
+            },
+            Commands::File { action } => match action {
+                FileAction::List { json, .. } | FileAction::Fetch { json, .. } => *json,
+            },
+            Commands::Archive { action } => match action {
+                ArchiveAction::Restore { json, .. }
+                | ArchiveAction::Verify { json, .. }
+                | ArchiveAction::Migrations { json } => *json,
+                ArchiveAction::Backup { .. } | ArchiveAction::Reindex => false,
+            },
+            Commands::Token { action } => match action {
+                TokenAction::Create { json, .. }
+                | TokenAction::List { json, .. }
+                | TokenAction::Revoke { json, .. }
+                | TokenAction::Prune { json } => *json,
+            },
+            Commands::Debug { .. }
+            | Commands::Daemon { .. }
+            | Commands::Completions { .. }
+            | Commands::Docs
+            | Commands::Complete { .. } => false,
+        }
+    }
+
+    pub fn update_notice_mode(&self) -> UpdateNoticeMode {
+        match self {
+            Commands::Docs
+            | Commands::Complete { .. }
+            | Commands::Completions { .. }
+            | Commands::Debug { .. }
+            | Commands::Token { .. }
+            | Commands::Update { .. }
+            | Commands::Chat {
+                action: ChatAction::Export { .. },
+            }
+            | Commands::Daemon {
+                action: DaemonAction::Run { .. } | DaemonAction::Status | DaemonAction::Logs { follow: true, .. },
+            } => UpdateNoticeMode::None,
+            Commands::Sync { json, notify, .. } => {
+                if *json || *notify {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::Full
+                }
+            }
+            Commands::Status { json } => {
+                if *json {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::CheckOnly
+                }
+            }
+            _ => {
+                if self.is_json_output() {
+                    UpdateNoticeMode::None
+                } else {
+                    UpdateNoticeMode::Full
+                }
+            }
+        }
+    }
+}
+
 pub enum CliError {
     Api(api::ApiError),
+    Live(LiveError),
     Runtime(String),
 }
 
 impl From<api::ApiError> for CliError {
     fn from(e: api::ApiError) -> Self {
         CliError::Api(e)
+    }
+}
+
+impl From<LiveError> for CliError {
+    fn from(e: LiveError) -> Self {
+        CliError::Live(e)
     }
 }
 
@@ -777,6 +1149,78 @@ fn min_interval(v: &str) -> Result<u64, String> {
         ));
     }
     Ok(n)
+}
+
+fn open_optional_archive() -> Result<Option<rusqlite::Connection>, CliError> {
+    if paths::archive_path().exists() {
+        Ok(Some(api::open_archive_readonly()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_text_arg(words: Vec<String>, stdin: bool) -> Result<String, CliError> {
+    if stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        Ok(buf)
+    } else {
+        Ok(words.join(" "))
+    }
+}
+
+fn load_media_paths(
+    paths_list: &[PathBuf],
+    max_count: usize,
+    max_bytes: usize,
+    kind: &str,
+) -> Result<Vec<MediaUpload>, CliError> {
+    if paths_list.len() > max_count {
+        return Err(CliError::Live(LiveError::bad(format!(
+            "Too many {kind}s ({}; max {max_count} per message).",
+            paths_list.len()
+        ))));
+    }
+    let mut out = Vec::with_capacity(paths_list.len());
+    for raw_path in paths_list {
+        let expanded = paths::expanduser(&raw_path.to_string_lossy());
+        let meta = fs::metadata(&expanded)
+            .map_err(|e| CliError::Live(LiveError::bad(format!("Cannot stat '{}': {e}", expanded.display()))))?;
+        if meta.len() > max_bytes as u64 {
+            return Err(CliError::Live(LiveError::bad(format!(
+                "{kind} '{}' is {} bytes (max {max_bytes} bytes).",
+                expanded.display(),
+                meta.len()
+            ))));
+        }
+        let file = fs::File::open(&expanded)
+            .map_err(|e| CliError::Live(LiveError::bad(format!("Cannot read '{}': {e}", expanded.display()))))?;
+        let mut bytes = Vec::with_capacity((meta.len() as usize).min(max_bytes));
+        file.take((max_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| CliError::Live(LiveError::bad(format!("Cannot read '{}': {e}", expanded.display()))))?;
+        if bytes.len() > max_bytes {
+            return Err(CliError::Live(LiveError::bad(format!(
+                "{kind} '{}' exceeds max size of {max_bytes} bytes.",
+                expanded.display()
+            ))));
+        }
+        let name = expanded
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CliError::Live(LiveError::bad(format!("Invalid file path '{}'.", expanded.display()))))?
+            .to_string();
+        let ct = compose::guess_mime_from_filename(&name).to_string();
+        out.push(MediaUpload {
+            filename: name,
+            content_type: ct,
+            bytes,
+        });
+    }
+    Ok(out)
 }
 
 pub fn run(cli: Cli) -> Result<i32, CliError> {
@@ -931,149 +1375,18 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             }
             Ok(if ok { 0 } else { 1 })
         }
-        Commands::Chats {
-            grep,
-            kind,
-            all,
-            member,
-            limit,
-            json,
-        } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let r = api::list_chats(&conn, grep.as_deref(), kind.as_deref(), limit, all, member.as_deref())?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            if let Some(mm) = r.get("memberMatches").and_then(|v| v.as_array()) {
-                if mm.len() > 1 {
-                    let names: Vec<&str> = mm
-                        .iter()
-                        .take(8)
-                        .filter_map(|m| m["name"].as_str().or(m["email"].as_str()).or(m["id"].as_str()))
-                        .collect();
-                    eprintln!(
-                        "# --member {} matched {} people: {}. Use a fuller name or their email to pick one.",
-                        Quoted(member.as_deref().unwrap_or("")),
-                        mm.len(),
-                        names.join(", ")
-                    );
-                }
-            }
-            let chats = r["chats"].as_array().cloned().unwrap_or_default();
-            for c in &chats {
-                let name: String = c["name"].as_str().unwrap_or("").chars().take(70).collect();
-                println!(
-                    "{}  {:<9} {:>5}  {:<70}  {}",
-                    short(c["lastActivityMs"].as_i64()),
-                    c["kind"].as_str().unwrap_or(""),
-                    c["messageCount"].as_i64().unwrap_or(0),
-                    name,
-                    c["id"].as_str().unwrap_or("")
-                );
-            }
-            let total = r["total"].as_u64().unwrap_or(0) as usize;
-            if total > chats.len() {
-                println!("... {} more (use --limit 0 for all)", total - chats.len());
-            }
-            Ok(0)
-        }
-        Commands::Messages {
-            chat,
-            around,
-            context,
-            thread,
-            history,
-            since,
-            until,
-            sender,
-            limit,
-            events,
-            json,
-        } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let r = api::read_messages(
-                &conn,
-                chat.as_deref(),
-                since.as_deref(),
-                until.as_deref(),
-                sender.as_deref(),
-                limit,
-                events,
-                thread.as_deref(),
-                history,
-                around.as_deref(),
-                context,
-            )?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            let c = &r["chat"];
-            if let Some(others) = r["otherMatches"].as_array().filter(|o| !o.is_empty()) {
-                eprintln!("# Using {}. Other matches:", Quoted(c["name"].as_str().unwrap_or("")));
-                for o in others {
-                    eprintln!(
-                        "#   {}  [{}]",
-                        o["name"].as_str().unwrap_or(""),
-                        o["id"].as_str().unwrap_or("")
-                    );
-                }
-            }
-            let msgs = r["messages"].as_array().cloned().unwrap_or_default();
-            if let Some(target) = r.get("aroundMessageId").and_then(|v| v.as_str()) {
-                println!(
-                    "# {}  ({}, {} messages around {target})\n",
-                    c["name"].as_str().unwrap_or(""),
-                    c["kind"].as_str().unwrap_or(""),
-                    msgs.len()
-                );
-                if r["hasBefore"].as_bool().unwrap_or(false) {
-                    println!("# earlier messages exist\n");
-                }
-                for m in &msgs {
-                    let pfx = if m["id"].as_str() == Some(target) { ">>> " } else { "" };
-                    println!("{}", fmt::fmt_message(m, pfx, None));
-                }
-                if r["hasAfter"].as_bool().unwrap_or(false) {
-                    println!("\n# later messages exist");
-                }
-                return Ok(0);
-            }
-            println!(
-                "# {}  ({}, showing {} of {})\n",
-                c["name"].as_str().unwrap_or(""),
-                c["kind"].as_str().unwrap_or(""),
-                msgs.len(),
-                r["matched"]
-            );
-            if c["kind"].as_str() == Some("channel") {
-                fmt::print_threaded(&msgs);
-            } else {
-                for m in &msgs {
-                    println!("{}", fmt::fmt_message(m, "", None));
-                }
-            }
-            if r["truncated"].as_bool().unwrap_or(false) {
-                let matched = r["matched"].as_u64().unwrap_or(0) as usize;
-                println!(
-                    "\n# {} earlier messages not shown (use --limit 0 or --since)",
-                    matched.saturating_sub(msgs.len())
-                );
-            }
-            Ok(0)
-        }
+        Commands::Chat { action } => run_chat(action),
+        Commands::Message { action } => run_message(action),
+        Commands::File { action } => run_file(action),
+        Commands::Presence { action, json } => run_presence(action, json),
         Commands::Search {
             query,
             chat,
             relevance,
-            include_history,
+            history,
             count,
             has_attachments,
-            since,
-            until,
+            time,
             sender,
             limit,
             events,
@@ -1087,12 +1400,12 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                 Some(&q),
                 chat.as_deref(),
                 sender.as_deref(),
-                since.as_deref(),
-                until.as_deref(),
+                time.since.as_deref(),
+                time.until.as_deref(),
                 limit,
                 if relevance { "relevance" } else { "recent" },
                 events,
-                include_history,
+                history,
                 count,
                 has_attachments,
             )?;
@@ -1132,210 +1445,6 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             };
             println!("\n# {} of {} {noun}{hint}", results.len(), r["matched"]);
             fmt::note_senders(r.get("senders"), sender.as_deref());
-            Ok(0)
-        }
-        Commands::Attachments {
-            query,
-            chat,
-            kind,
-            file_type,
-            since,
-            until,
-            sender,
-            limit,
-            json,
-        } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let q = query.join(" ");
-            let q_opt = if q.is_empty() { None } else { Some(q.as_str()) };
-            let r = api::attachments(
-                &conn,
-                q_opt,
-                chat.as_deref(),
-                sender.as_deref(),
-                kind.as_deref(),
-                file_type.as_deref(),
-                since.as_deref(),
-                until.as_deref(),
-                limit,
-            )?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            let atts = r["attachments"].as_array().cloned().unwrap_or_default();
-            for x in &atts {
-                let where_s = x["chatName"].as_str().or(x["chatId"].as_str()).unwrap_or("?");
-                let k = x["kind"].as_str().unwrap_or("");
-                let u = x["url"].as_str().unwrap_or("");
-                let n = x["name"].as_str().unwrap_or("");
-                let name = if k == "image" || n == u || n.is_empty() {
-                    String::new()
-                } else {
-                    format!("{n}  ")
-                };
-                let gone = if x["messageDeleted"].as_bool().unwrap_or(false) {
-                    "  (message deleted)"
-                } else {
-                    ""
-                };
-                println!(
-                    "[{}] {}  @ {where_s}{gone}\n    [{k}] {name}{u}",
-                    short(x["timeMs"].as_i64()),
-                    x["sender"].as_str().filter(|s| !s.is_empty()).unwrap_or("?")
-                );
-                if let Some(lp) = x["localPath"].as_str() {
-                    println!("    [local] {lp}");
-                }
-            }
-            let hint = if r["truncated"].as_bool().unwrap_or(false) {
-                " (use --limit 0 for all)"
-            } else {
-                ""
-            };
-            println!("\n# {} of {} attachments{hint}", atts.len(), r["matched"]);
-            fmt::note_senders(r.get("senders"), sender.as_deref());
-            Ok(0)
-        }
-        Commands::Fetch {
-            target,
-            message,
-            index,
-            out,
-            force_download,
-            max_bytes,
-            json,
-        } => {
-            let joined = target.join(" ");
-            let t_opt = if joined.trim().is_empty() {
-                None
-            } else {
-                Some(joined.trim())
-            };
-            if t_opt.is_none() && message.is_none() {
-                return Err(CliError::Api(api::ApiError::bad(
-                    "bad_param",
-                    "Provide a URL, message id, filename query, or --message MSG_ID.",
-                )));
-            }
-            let is_url = t_opt
-                .map(|t| {
-                    let l = t.to_ascii_lowercase();
-                    l.starts_with("https://") || l.starts_with("http://")
-                })
-                .unwrap_or(false);
-            let conn = if is_url {
-                if paths::archive_path().exists() {
-                    Some(api::open_archive_readonly()?)
-                } else {
-                    None
-                }
-            } else {
-                let c = api::open_archive_readonly()?;
-                api::require_data(&c)?;
-                Some(c)
-            };
-            let res = fetch::fetch_attachment_with_limit(
-                conn.as_ref(),
-                t_opt,
-                message.as_deref(),
-                index,
-                out.as_deref(),
-                force_download,
-                max_bytes,
-            )
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-            if json {
-                fmt::print_json(&res);
-                return Ok(0);
-            }
-            println!(
-                "{}  ({} bytes, {}, {})",
-                res["path"].as_str().unwrap_or(""),
-                res["sizeBytes"],
-                res["contentType"].as_str().unwrap_or(""),
-                res["source"].as_str().unwrap_or("")
-            );
-            Ok(0)
-        }
-        Commands::Send {
-            target,
-            message,
-            stdin,
-            reply_to,
-            html,
-            client_message_id,
-            dry_run,
-            yes,
-            json,
-        } => {
-            let text = if stdin {
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|e| CliError::Runtime(e.to_string()))?;
-                buf
-            } else {
-                message.join(" ")
-            };
-            if text.trim().is_empty() {
-                return Err(CliError::Api(api::ApiError::bad(
-                    "bad_param",
-                    "Provide message text or pass --stdin.",
-                )));
-            }
-            let effective_dry_run = dry_run || !yes;
-            let conn = if paths::archive_path().exists() {
-                Some(api::open_archive_readonly()?)
-            } else {
-                None
-            };
-            let res = send::send_message(
-                conn.as_ref(),
-                &target,
-                &text,
-                reply_to.as_deref(),
-                html,
-                client_message_id.as_deref(),
-                effective_dry_run,
-            )
-            .map_err(|e| CliError::Runtime(e.to_string()))?;
-            if json {
-                fmt::print_json(&res);
-                return Ok(0);
-            }
-            if res["dryRun"].as_bool().unwrap_or(false) {
-                let status = if res["restricted"].as_bool().unwrap_or(true) {
-                    "RESTRICTED (set TEAMS_CLI_ENABLE_SEND=1 to enable)"
-                } else {
-                    "enabled"
-                };
-                let allow = if res["allowed"].as_bool().unwrap_or(true) {
-                    ""
-                } else {
-                    "  [BLOCKED by TEAMS_CLI_SEND_ALLOWLIST]"
-                };
-                println!("[RESTRICTED — dry run; sending is {status}]{allow}");
-                println!(
-                    "  To:      {}  ({}, {})",
-                    res["chatName"].as_str().unwrap_or(""),
-                    res["chatKind"].as_str().unwrap_or(""),
-                    res["conversationId"].as_str().unwrap_or("")
-                );
-                if let Some(rt) = res["replyTo"].as_str() {
-                    println!("  Reply:   thread {rt}");
-                }
-                println!("  Text:    {}", res["text"].as_str().unwrap_or(""));
-                println!("Nothing was sent. Re-run with TEAMS_CLI_ENABLE_SEND=1 and --yes to send.");
-                return Ok(0);
-            }
-            println!(
-                "Sent message {} to {} ({}).",
-                res["messageId"].as_str().unwrap_or("?"),
-                res["chatName"].as_str().unwrap_or(""),
-                res["conversationId"].as_str().unwrap_or("")
-            );
             Ok(0)
         }
         Commands::Changes {
@@ -1557,8 +1666,7 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             Ok(0)
         }
         Commands::Mentions {
-            since,
-            until,
+            time,
             chat,
             unread,
             limit,
@@ -1568,8 +1676,8 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             api::require_data(&conn)?;
             let r = views::mentions(
                 &conn,
-                since.as_deref(),
-                until.as_deref(),
+                time.since.as_deref(),
+                time.until.as_deref(),
                 chat.as_deref(),
                 unread,
                 limit,
@@ -1603,8 +1711,7 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             Ok(0)
         }
         Commands::Calls {
-            since,
-            until,
+            time,
             person,
             missed,
             limit,
@@ -1614,8 +1721,8 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             api::require_data(&conn)?;
             let r = views::calls(
                 &conn,
-                since.as_deref(),
-                until.as_deref(),
+                time.since.as_deref(),
+                time.until.as_deref(),
                 person.as_deref(),
                 missed,
                 limit,
@@ -1645,15 +1752,20 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             Ok(0)
         }
         Commands::Meetings {
-            since,
-            until,
+            time,
             grep,
             limit,
             json,
         } => {
             let conn = api::open_archive_readonly()?;
             api::require_data(&conn)?;
-            let r = views::meetings(&conn, since.as_deref(), until.as_deref(), grep.as_deref(), limit)?;
+            let r = views::meetings(
+                &conn,
+                time.since.as_deref(),
+                time.until.as_deref(),
+                grep.as_deref(),
+                limit,
+            )?;
             if json {
                 fmt::print_json(&r);
                 return Ok(0);
@@ -1692,436 +1804,10 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             fmt::print_more(&r, "meetings", "meetings");
             Ok(0)
         }
-        Commands::Saved { all, limit, json } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let r = views::saved(&conn, all, limit)?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            let items = r["saved"].as_array().cloned().unwrap_or_default();
-            fmt::print_items(&items, "savedAtMs", |x| {
-                let mut s = String::new();
-                if x["unsaved"].as_bool().unwrap_or(false) {
-                    s.push_str("  (unsaved)");
-                }
-                if x["deleted"].as_bool().unwrap_or(false) {
-                    s.push_str("  (message deleted)");
-                }
-                s
-            });
-            fmt::print_more(&r, "saved", "saved messages");
-            Ok(0)
-        }
-        Commands::Pinned { chat, limit, json } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let r = views::pinned(&conn, chat.as_deref(), limit)?;
-            if json {
-                fmt::print_json(&r);
-                return Ok(0);
-            }
-            let items = r["pinned"].as_array().cloned().unwrap_or_default();
-            fmt::print_items(&items, "timeMs", |_| String::new());
-            fmt::print_more(&r, "pinned", "pinned messages");
-            Ok(0)
-        }
-        Commands::Export {
-            chat,
-            since,
-            until,
-            sender,
-            thread,
-            events,
-            history,
-            out,
-        } => {
-            let conn = api::open_archive_readonly()?;
-            api::require_data(&conn)?;
-            let md = export::export_markdown(
-                &conn,
-                &chat,
-                since.as_deref(),
-                until.as_deref(),
-                sender.as_deref(),
-                events,
-                history,
-                thread.as_deref(),
-            )?;
-            if let Some(out_s) = out {
-                let dest = paths::expanduser(&out_s);
-                paths::atomic_write_text(&dest, &md).map_err(|e| CliError::Runtime(e.to_string()))?;
-                eprintln!("Wrote {}", dest.display());
-            } else {
-                print!("{md}");
-            }
-            Ok(0)
-        }
-        Commands::Archive { action } => match action {
-            ArchiveAction::Verify { file, no_backups, json } => {
-                let target = file.as_deref().map(paths::expanduser);
-                let res = backups::verify_archive(None, target.as_deref(), !no_backups);
-                let ok = res["ok"].as_bool().unwrap_or(false);
-                if json {
-                    fmt::print_json(&res);
-                    return Ok(if ok { 0 } else { 1 });
-                }
-                let label = res["target"].as_str().or(res["archive"].as_str()).unwrap_or("");
-                println!("{}  {label}", if ok { "OK" } else { "FAILED" });
-                if let Some(ch) = res["checks"].as_object() {
-                    for (k, v) in ch {
-                        let s = if let Some(b) = v.as_bool() {
-                            if b {
-                                "ok".to_string()
-                            } else {
-                                "FAILED".to_string()
-                            }
-                        } else if let Some(rows) = v.get("rows").and_then(|x| x.as_u64()) {
-                            let bad = v.get("bad").and_then(|x| x.as_u64()).unwrap_or(0);
-                            if bad > 0 {
-                                format!("{rows} versions decode, {bad} do not")
-                            } else {
-                                format!("{rows} versions decode")
-                            }
-                        } else {
-                            v.to_string()
-                        };
-                        println!("  {k:<24} {s}");
-                    }
-                }
-                if let Some(bks) = res["backups"].as_array().filter(|b| !b.is_empty()) {
-                    let good = bks.iter().filter(|b| b["ok"].as_bool().unwrap_or(false)).count();
-                    println!("  backups                  {good} of {} pass quick_check", bks.len());
-                }
-                for e in res["errors"].as_array().into_iter().flatten() {
-                    if let Some(s) = e.as_str() {
-                        eprintln!("! {s}");
-                    }
-                }
-                Ok(if ok { 0 } else { 1 })
-            }
-            ArchiveAction::Restore {
-                backup,
-                yes,
-                no_safety_backup,
-                json,
-            } => {
-                let bpath = paths::expanduser(&backup);
-                if yes {
-                    let name = bpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !bpath.is_file() {
-                        return Err(CliError::Runtime(format!(
-                            "{} failed verification: file does not exist",
-                            bpath.display()
-                        )));
-                    }
-                    if !(name.ends_with(".sqlite3") || name.ends_with(".sqlite3.xz")) {
-                        return Err(CliError::Runtime(format!(
-                            "{} failed verification: not a .sqlite3 or .sqlite3.xz backup",
-                            bpath.display()
-                        )));
-                    }
-                    return restore_now(&bpath, no_safety_backup, json);
-                }
-                let check = backups::verify_archive(None, Some(&bpath), false);
-                if !check["ok"].as_bool().unwrap_or(false) {
-                    let errs: Vec<&str> = check["errors"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .take(3)
-                        .filter_map(|v| v.as_str())
-                        .collect();
-                    return Err(CliError::Runtime(format!(
-                        "{} failed verification: {}",
-                        bpath.display(),
-                        errs.join("; ")
-                    )));
-                }
-                let dest = paths::archive_path().to_string_lossy().into_owned();
-                if json {
-                    fmt::print_json(&json!({
-                        "dryRun": true,
-                        "backup": bpath.to_string_lossy(),
-                        "verified": true,
-                        "archive": dest,
-                    }));
-                    return Ok(0);
-                }
-                println!("Backup {} verified OK.", bpath.display());
-                println!("Restoring will:");
-                println!("  1. stop the background daemon, if it is running");
-                if !no_safety_backup {
-                    println!(
-                        "  2. save a permanent safety backup of the current archive in {}",
-                        paths::backups_dir().display()
-                    );
-                }
-                println!(
-                    "  {}. replace {dest} with the backup, then restart the daemon",
-                    if !no_safety_backup { 3 } else { 2 }
-                );
-                println!("Nothing has changed yet. Re-run with --yes to proceed.");
-                Ok(0)
-            }
-            ArchiveAction::Backup { out } => {
-                let conn = archive::connect(None)?;
-                let dest = if let Some(o) = out {
-                    backups::backup(&conn, &paths::expanduser(&o))?
-                } else {
-                    let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
-                    backups::backup_if_due(&conn, 0.0)?
-                        .ok_or_else(|| CliError::Runtime("Backup skipped".to_string()))?
-                };
-                println!("Backup written: {}", dest.display());
-                Ok(0)
-            }
-            ArchiveAction::Reindex => {
-                let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
-                let conn = archive::connect(None)?;
-                let n = archive::rerender(&conn, true)?;
-                println!("Re-rendered {n} messages from stored HTML.");
-                Ok(0)
-            }
-            ArchiveAction::Migrations { json } => {
-                let conn = api::open_archive_readonly()?;
-                let current: i64 = conn
-                    .query_row("PRAGMA user_version", [], |r| r.get(0))
-                    .map_err(|e| CliError::Runtime(e.to_string()))?;
-                let applied = migrations::history(&conn)?;
-                let pending = migrations::pending(&conn)?;
-                if json {
-                    fmt::print_json(&json!({
-                        "currentVersion": current,
-                        "targetVersion": archive::SCHEMA_VERSION,
-                        "applied": applied.iter().map(|m| json!({
-                            "version": m.version,
-                            "name": m.name,
-                            "appliedAt": iso((m.applied_at != 0).then_some(m.applied_at)),
-                            "appliedAtMs": m.applied_at,
-                            "appVersion": m.app_version,
-                            "durationMs": m.duration_ms,
-                        })).collect::<Vec<_>>(),
-                        "pending": pending.iter().map(|m| json!({
-                            "version": m.version,
-                            "name": m.name,
-                            "description": m.description,
-                        })).collect::<Vec<_>>(),
-                    }));
-                    return Ok(0);
-                }
-                println!("Schema version: v{current} (target v{})", archive::SCHEMA_VERSION);
-                for m in &applied {
-                    let when = if m.applied_at == 0 {
-                        "backfill".to_string()
-                    } else {
-                        short(Some(m.applied_at))
-                    };
-                    println!(
-                        "  v{:<3} {:<44} {:<16} app={} ({}ms)",
-                        m.version, m.name, when, m.app_version, m.duration_ms
-                    );
-                }
-                if !pending.is_empty() {
-                    println!("\nPending:");
-                    for m in &pending {
-                        println!("  v{:<3} {:<44} {}", m.version, m.name, m.description);
-                    }
-                }
-                Ok(0)
-            }
-        },
-        Commands::Daemon { action } => match action {
-            DaemonAction::Install { interval, port } => {
-                let path = launchd::install(interval, port).map_err(CliError::Runtime)?;
-                println!(
-                    "Installed {}\nThe daemon checks for updates every {} and serves http://127.0.0.1:{}",
-                    path.display(),
-                    interval_label(interval),
-                    port.unwrap_or_else(paths::port)
-                );
-                println!("Logs: {}", paths::log_dir().display());
-                Ok(0)
-            }
-            DaemonAction::Uninstall => {
-                println!(
-                    "{}",
-                    if launchd::uninstall() {
-                        "Removed."
-                    } else {
-                        "Not installed."
-                    }
-                );
-                Ok(0)
-            }
-            DaemonAction::Restart => {
-                let path = launchd::restart().map_err(CliError::Runtime)?;
-                println!("Restarted {}.", path.display());
-                Ok(0)
-            }
-            DaemonAction::Status => {
-                fmt::print_json(&launchd::status());
-                Ok(0)
-            }
-            DaemonAction::Logs { lines, follow } => {
-                let log_path = paths::log_dir().join("daemon.log");
-                tail_daemon_log(&log_path, lines, follow).map_err(CliError::Runtime)?;
-                Ok(0)
-            }
-            DaemonAction::Run {
-                port,
-                interval,
-                no_sync,
-                log_stderr,
-            } => {
-                daemon::serve(port, interval, !no_sync, !log_stderr).map_err(CliError::Runtime)?;
-                Ok(0)
-            }
-        },
-        Commands::Token { action } => match action {
-            TokenAction::Create { name, expires, json } => {
-                let res = daemon::create_named_token(&name, expires.as_deref()).map_err(CliError::Runtime)?;
-                if json {
-                    fmt::print_json(&res);
-                } else {
-                    println!("{}", res["token"].as_str().unwrap_or(""));
-                    let exp = res["expiresAt"].as_str().unwrap_or("never");
-                    eprintln!(
-                        "# Created token {} (id {}, expires: {}). Save it now; only its SHA-256 hash is stored.",
-                        Quoted(res["name"].as_str().unwrap_or("")),
-                        res["id"].as_str().unwrap_or(""),
-                        exp
-                    );
-                }
-                Ok(0)
-            }
-            TokenAction::List { include_expired, json } => {
-                let res = daemon::list_named_tokens(include_expired).map_err(CliError::Runtime)?;
-                if json {
-                    fmt::print_json(&res);
-                    return Ok(0);
-                }
-                let tokens = res["tokens"].as_array().cloned().unwrap_or_default();
-                if tokens.is_empty() {
-                    println!("No named tokens. Create one with `teams token create <name>`.");
-                    return Ok(0);
-                }
-                for t in &tokens {
-                    let exp = t["expiresAt"].as_str().unwrap_or("never");
-                    let state = if t["expired"].as_bool().unwrap_or(false) {
-                        "expired"
-                    } else {
-                        "active"
-                    };
-                    println!(
-                        "{}  {:<20}  {:<12}  {:<7}  expires {}",
-                        t["id"].as_str().unwrap_or(""),
-                        t["name"].as_str().unwrap_or(""),
-                        t["prefix"].as_str().unwrap_or(""),
-                        state,
-                        exp
-                    );
-                }
-                Ok(0)
-            }
-            TokenAction::Revoke { target, json } => {
-                let res = daemon::revoke_named_token(&target).map_err(CliError::Runtime)?;
-                if json {
-                    fmt::print_json(&res);
-                } else {
-                    println!(
-                        "Revoked token {} (id {}).",
-                        Quoted(res["name"].as_str().unwrap_or("")),
-                        res["id"].as_str().unwrap_or("")
-                    );
-                }
-                Ok(0)
-            }
-            TokenAction::Prune { json } => {
-                let res = daemon::prune_expired_tokens().map_err(CliError::Runtime)?;
-                if json {
-                    fmt::print_json(&res);
-                } else {
-                    println!(
-                        "Pruned {} expired token(s) ({} remaining).",
-                        res["pruned"], res["remaining"]
-                    );
-                }
-                Ok(0)
-            }
-        },
-        Commands::Debug { action } => match action {
-            DebugAction::Records {
-                source,
-                key,
-                since,
-                all_versions,
-                limit,
-                json,
-            } => {
-                let conn = api::open_archive_readonly()?;
-                match source {
-                    None => {
-                        let r = api::record_sources(&conn)?;
-                        if json {
-                            fmt::print_json(&r);
-                        } else if let Some(srcs) = r["sources"].as_array() {
-                            for s in srcs {
-                                println!(
-                                    "{:<58} {:>6} records {:>7} versions  last {}",
-                                    s["source"].as_str().unwrap_or(""),
-                                    s["records"].as_i64().unwrap_or(0),
-                                    s["versions"].as_i64().unwrap_or(0),
-                                    s["lastCaptured"].as_str().unwrap_or("-")
-                                );
-                            }
-                        }
-                        Ok(0)
-                    }
-                    Some(src) => {
-                        let r = api::records(&conn, &src, key.as_deref(), since.as_deref(), limit, all_versions)?;
-                        if let Some(recs) = r["records"].as_array() {
-                            for rec in recs {
-                                println!("{}", json_codec::to_string(rec));
-                            }
-                        }
-                        Ok(0)
-                    }
-                }
-            }
-            DebugAction::Stores => {
-                let cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
-                    .map_err(|e| CliError::Runtime(e.to_string()))?;
-                for name in cache.database_names() {
-                    println!("{name}\n    {}", cache.stores(&name).join(", "));
-                }
-                Ok(0)
-            }
-            DebugAction::Dump { db, store } => {
-                let mut cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
-                    .map_err(|e| CliError::Runtime(e.to_string()))?;
-                let matches: Vec<String> = cache.database_names().into_iter().filter(|n| n.contains(&db)).collect();
-                let Some(first_db) = matches.first() else {
-                    eprintln!("No database name contains {}", Quoted(&db));
-                    return Ok(2);
-                };
-                let stores = cache.stores(first_db);
-                if !stores.iter().any(|s| s == &store) {
-                    let avail = if stores.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        stores.join(", ")
-                    };
-                    eprintln!("No store {} in {first_db}. Stores: {avail}", Quoted(&store));
-                    return Ok(2);
-                }
-                for (k, v) in cache.raw_records_with_keys(first_db, &store) {
-                    println!("{}", json_codec::to_string(&json!({"key": k, "value": v})));
-                }
-                Ok(0)
-            }
-        },
+        Commands::Archive { action } => run_archive(action),
+        Commands::Daemon { action } => run_daemon(action),
+        Commands::Token { action } => run_token(action),
+        Commands::Debug { action } => run_debug(action),
         Commands::Completions { shell } => {
             print!("{}", completions::generate_script(shell));
             Ok(0)
@@ -2159,8 +1845,8 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
                         outcome.current_version, outcome.target_version, outcome.target_triple
                     );
                     if let Some(ref hash) = outcome.sha256 {
-                        let short = &hash[..hash.len().min(12)];
-                        println!("  {green}{:<12}{reset} sha256 {short}...", "verified");
+                        let short_h = &hash[..hash.len().min(12)];
+                        println!("  {green}{:<12}{reset} sha256 {short_h}...", "verified");
                     }
                     println!("  {green}{:<12}{reset} {}", "installed", outcome.binary_path);
                     if outcome.daemon_restarted {
@@ -2182,6 +1868,1519 @@ pub fn run(cli: Cli) -> Result<i32, CliError> {
             if let Some(ref err) = outcome.daemon_restart_error {
                 eprintln!("teams: daemon restart failed ({err}); run `teams daemon restart`");
                 return Ok(1);
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn run_chat(action: ChatAction) -> Result<i32, CliError> {
+    let live = LiveService::default();
+    let principal = Principal::cli();
+    match action {
+        ChatAction::List {
+            grep,
+            kind,
+            all,
+            member,
+            limit,
+            json,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let r = api::list_chats(&conn, grep.as_deref(), kind.as_deref(), limit, all, member.as_deref())?;
+            if json {
+                fmt::print_json(&r);
+                return Ok(0);
+            }
+            if let Some(mm) = r.get("memberMatches").and_then(|v| v.as_array()) {
+                if mm.len() > 1 {
+                    let names: Vec<&str> = mm
+                        .iter()
+                        .take(8)
+                        .filter_map(|m| m["name"].as_str().or(m["email"].as_str()).or(m["id"].as_str()))
+                        .collect();
+                    eprintln!(
+                        "# --member {} matched {} people: {}. Use a fuller name or their email to pick one.",
+                        Quoted(member.as_deref().unwrap_or("")),
+                        mm.len(),
+                        names.join(", ")
+                    );
+                }
+            }
+            let chats = r["chats"].as_array().cloned().unwrap_or_default();
+            for c in &chats {
+                let name: String = c["name"].as_str().unwrap_or("").chars().take(70).collect();
+                println!(
+                    "{}  {:<9} {:>5}  {:<70}  {}",
+                    short(c["lastActivityMs"].as_i64()),
+                    c["kind"].as_str().unwrap_or(""),
+                    c["messageCount"].as_i64().unwrap_or(0),
+                    name,
+                    c["id"].as_str().unwrap_or("")
+                );
+            }
+            let total = r["total"].as_u64().unwrap_or(0) as usize;
+            if total > chats.len() {
+                println!("... {} more (use --limit 0 for all)", total - chats.len());
+            }
+            Ok(0)
+        }
+        ChatAction::Export {
+            chat,
+            time,
+            sender,
+            thread,
+            events,
+            history,
+            out,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let md = export::export_markdown(
+                &conn,
+                &chat,
+                time.since.as_deref(),
+                time.until.as_deref(),
+                sender.as_deref(),
+                events,
+                history,
+                thread.as_deref(),
+            )?;
+            if let Some(out_s) = out {
+                let dest = paths::expanduser(&out_s);
+                paths::atomic_write_text(&dest, &md).map_err(|e| CliError::Runtime(e.to_string()))?;
+                eprintln!("Wrote {}", dest.display());
+            } else {
+                print!("{md}");
+            }
+            Ok(0)
+        }
+        ChatAction::New { members, topic, write } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.create_chat(
+                archive,
+                &principal,
+                CreateChatRequest {
+                    members,
+                    topic,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would create chat with {} member(s).",
+                    res["members"].as_array().map_or(0, Vec::len)
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Created chat {}.",
+                res["conversationId"].as_str().unwrap_or("(pending)")
+            );
+            Ok(0)
+        }
+        ChatAction::Rename { chat, topic, write } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.rename_chat(
+                archive,
+                &principal,
+                RenameChatRequest {
+                    chat,
+                    topic,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would rename {} to {}.",
+                    res["chatName"].as_str().unwrap_or(""),
+                    Quoted(res["topic"].as_str().unwrap_or(""))
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Renamed {} ({}) to {}.",
+                res["previousName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or(""),
+                Quoted(res["topic"].as_str().unwrap_or(""))
+            );
+            Ok(0)
+        }
+        ChatAction::AddMember { chat, member, write } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.change_member(
+                archive,
+                &principal,
+                MemberChangeRequest {
+                    chat,
+                    member,
+                    add: true,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would add {} to {}.",
+                    res["member"]["name"].as_str().unwrap_or(""),
+                    res["chatName"].as_str().unwrap_or("")
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Added {} to {} ({}).",
+                res["member"]["name"].as_str().unwrap_or(""),
+                res["chatName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+        ChatAction::RemoveMember { chat, member, write } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.change_member(
+                archive,
+                &principal,
+                MemberChangeRequest {
+                    chat,
+                    member,
+                    add: false,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would remove {} from {}.",
+                    res["member"]["name"].as_str().unwrap_or(""),
+                    res["chatName"].as_str().unwrap_or("")
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Removed {} from {} ({}).",
+                res["member"]["name"].as_str().unwrap_or(""),
+                res["chatName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+        ChatAction::Read { chat, flags } => run_chat_read_state(&live, &principal, chat, flags, true),
+        ChatAction::Unread { chat, flags } => run_chat_read_state(&live, &principal, chat, flags, false),
+        ChatAction::Mute { chat, flags } => run_chat_mute_state(&live, &principal, chat, flags, true),
+        ChatAction::Unmute { chat, flags } => run_chat_mute_state(&live, &principal, chat, flags, false),
+    }
+}
+
+fn run_chat_read_state(
+    live: &LiveService,
+    principal: &Principal,
+    chat: String,
+    flags: LightWriteArgs,
+    mark_read: bool,
+) -> Result<i32, CliError> {
+    let conn = open_optional_archive()?;
+    let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+    let res = live.set_read_state(
+        archive,
+        principal,
+        ChatStateRequest {
+            chat,
+            dry_run: flags.dry_run,
+        },
+        mark_read,
+    )?;
+    if flags.json {
+        fmt::print_json(&res);
+        return Ok(0);
+    }
+    let verb = if mark_read { "read" } else { "unread" };
+    if res["dryRun"].as_bool().unwrap_or(false) {
+        println!(
+            "[dry run] Would mark {} as {verb}.",
+            res["chatName"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "Marked {} ({}) as {verb}.",
+            res["chatName"].as_str().unwrap_or(""),
+            res["conversationId"].as_str().unwrap_or("")
+        );
+    }
+    Ok(0)
+}
+
+fn run_chat_mute_state(
+    live: &LiveService,
+    principal: &Principal,
+    chat: String,
+    flags: LightWriteArgs,
+    muted: bool,
+) -> Result<i32, CliError> {
+    let conn = open_optional_archive()?;
+    let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+    let res = live.set_mute_state(
+        archive,
+        principal,
+        ChatStateRequest {
+            chat,
+            dry_run: flags.dry_run,
+        },
+        muted,
+    )?;
+    if flags.json {
+        fmt::print_json(&res);
+        return Ok(0);
+    }
+    let verb = if muted { "Muted" } else { "Unmuted" };
+    if res["dryRun"].as_bool().unwrap_or(false) {
+        println!(
+            "[dry run] Would set muted={muted} on {}.",
+            res["chatName"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{verb} {} ({}).",
+            res["chatName"].as_str().unwrap_or(""),
+            res["conversationId"].as_str().unwrap_or("")
+        );
+    }
+    Ok(0)
+}
+
+fn run_message(action: MessageAction) -> Result<i32, CliError> {
+    let live = LiveService::default();
+    let principal = Principal::cli();
+    match action {
+        MessageAction::List {
+            chat,
+            around,
+            context,
+            thread,
+            history,
+            time,
+            sender,
+            limit,
+            events,
+            json,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let r = api::read_messages(
+                &conn,
+                chat.as_deref(),
+                time.since.as_deref(),
+                time.until.as_deref(),
+                sender.as_deref(),
+                limit,
+                events,
+                thread.as_deref(),
+                history,
+                around.as_deref(),
+                context,
+            )?;
+            if json {
+                fmt::print_json(&r);
+                return Ok(0);
+            }
+            let c = &r["chat"];
+            if let Some(others) = r["otherMatches"].as_array().filter(|o| !o.is_empty()) {
+                eprintln!("# Using {}. Other matches:", Quoted(c["name"].as_str().unwrap_or("")));
+                for o in others {
+                    eprintln!(
+                        "#   {}  [{}]",
+                        o["name"].as_str().unwrap_or(""),
+                        o["id"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            let msgs = r["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(target) = r.get("aroundMessageId").and_then(|v| v.as_str()) {
+                println!(
+                    "# {}  ({}, {} messages around {target})\n",
+                    c["name"].as_str().unwrap_or(""),
+                    c["kind"].as_str().unwrap_or(""),
+                    msgs.len()
+                );
+                if r["hasBefore"].as_bool().unwrap_or(false) {
+                    println!("# earlier messages exist\n");
+                }
+                for m in &msgs {
+                    let pfx = if m["id"].as_str() == Some(target) { ">>> " } else { "" };
+                    println!("{}", fmt::fmt_message(m, pfx, None));
+                }
+                if r["hasAfter"].as_bool().unwrap_or(false) {
+                    println!("\n# later messages exist");
+                }
+                return Ok(0);
+            }
+            println!(
+                "# {}  ({}, showing {} of {})\n",
+                c["name"].as_str().unwrap_or(""),
+                c["kind"].as_str().unwrap_or(""),
+                msgs.len(),
+                r["matched"]
+            );
+            if c["kind"].as_str() == Some("channel") {
+                fmt::print_threaded(&msgs);
+            } else {
+                for m in &msgs {
+                    println!("{}", fmt::fmt_message(m, "", None));
+                }
+            }
+            if r["truncated"].as_bool().unwrap_or(false) {
+                let matched = r["matched"].as_u64().unwrap_or(0) as usize;
+                println!(
+                    "\n# {} earlier messages not shown (use --limit 0 or --since)",
+                    matched.saturating_sub(msgs.len())
+                );
+            }
+            Ok(0)
+        }
+        MessageAction::Saved {
+            include_unsaved,
+            limit,
+            json,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let r = views::saved(&conn, include_unsaved, limit)?;
+            if json {
+                fmt::print_json(&r);
+                return Ok(0);
+            }
+            let items = r["saved"].as_array().cloned().unwrap_or_default();
+            fmt::print_items(&items, "savedAtMs", |x| {
+                let mut s = String::new();
+                if x["unsaved"].as_bool().unwrap_or(false) {
+                    s.push_str("  (unsaved)");
+                }
+                if x["deleted"].as_bool().unwrap_or(false) {
+                    s.push_str("  (message deleted)");
+                }
+                s
+            });
+            fmt::print_more(&r, "saved", "saved messages");
+            Ok(0)
+        }
+        MessageAction::Pinned { chat, limit, json } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let r = views::pinned(&conn, chat.as_deref(), limit)?;
+            if json {
+                fmt::print_json(&r);
+                return Ok(0);
+            }
+            let items = r["pinned"].as_array().cloned().unwrap_or_default();
+            fmt::print_items(&items, "timeMs", |_| String::new());
+            fmt::print_more(&r, "pinned", "pinned messages");
+            Ok(0)
+        }
+        MessageAction::Send {
+            target,
+            message,
+            stdin,
+            reply_to,
+            quote,
+            subject,
+            important,
+            urgent,
+            markdown,
+            html,
+            mention,
+            image,
+            file,
+            client_message_id,
+            idempotency_key,
+            write,
+        } => {
+            let text = read_text_arg(message, stdin)?;
+            let images = load_media_paths(
+                &image,
+                crate::live::service::messages::MAX_IMAGES_PER_MESSAGE,
+                ams::MAX_IMAGE_BYTES,
+                "Image",
+            )?;
+            let files = load_media_paths(
+                &file,
+                crate::live::service::messages::MAX_FILES_PER_MESSAGE,
+                sharepoint::MAX_SIMPLE_FILE_BYTES,
+                "File",
+            )?;
+            let format = if html {
+                BodyFormat::Html
+            } else if markdown {
+                BodyFormat::Markdown
+            } else {
+                BodyFormat::Plain
+            };
+            let importance = if urgent {
+                Importance::Urgent
+            } else if important {
+                Importance::High
+            } else {
+                Importance::Normal
+            };
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.send_message(
+                archive,
+                &principal,
+                SendMessageRequest {
+                    target,
+                    text,
+                    format,
+                    reply_to,
+                    quote,
+                    subject,
+                    importance,
+                    mentions: mention,
+                    images,
+                    files,
+                    client_message_id,
+                    idempotency_key,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                let status = if res["restricted"].as_bool().unwrap_or(true) {
+                    format!("RESTRICTED (set {}=1 to enable)", policy::ENABLE_WRITES_ENV)
+                } else {
+                    "enabled".to_string()
+                };
+                let allow = if res["allowed"].as_bool().unwrap_or(true) {
+                    ""
+                } else {
+                    "  [BLOCKED by TEAMS_CLI_WRITE_ALLOWLIST]"
+                };
+                println!("[dry run; live writes are {status}]{allow}");
+                println!(
+                    "  To:      {}  ({}, {})",
+                    res["chatName"].as_str().unwrap_or(""),
+                    res["chatKind"].as_str().unwrap_or(""),
+                    res["conversationId"].as_str().unwrap_or("")
+                );
+                if let Some(rt) = res["replyTo"].as_str() {
+                    println!("  Reply:   thread {rt}");
+                }
+                if let Some(q) = res["quoteMessageId"].as_str() {
+                    println!("  Quote:   message {q}");
+                }
+                if let Some(s) = res["subject"].as_str() {
+                    println!("  Subject: {s}");
+                }
+                if let Some(imp) = res["importance"].as_str() {
+                    println!("  Level:   {imp}");
+                }
+                if let Some(ms) = res["mentions"].as_array().filter(|a| !a.is_empty()) {
+                    let names: Vec<&str> = ms.iter().filter_map(|m| m["name"].as_str()).collect();
+                    println!("  Mention: {}", names.join(", "));
+                }
+                if let Some(imgs) = res["images"].as_array().filter(|a| !a.is_empty()) {
+                    let names: Vec<&str> = imgs.iter().filter_map(|i| i["name"].as_str()).collect();
+                    println!("  Images:  {}", names.join(", "));
+                }
+                if let Some(fs) = res["files"].as_array().filter(|a| !a.is_empty()) {
+                    let names: Vec<&str> = fs.iter().filter_map(|f| f["name"].as_str()).collect();
+                    println!("  Files:   {}", names.join(", "));
+                }
+                println!("  Text:    {}", res["text"].as_str().unwrap_or(""));
+                println!(
+                    "Nothing was sent. Re-run with {}=1 and --yes to send.",
+                    policy::ENABLE_WRITES_ENV
+                );
+                return Ok(0);
+            }
+            println!(
+                "Sent message {} to {} ({}).",
+                res["messageId"].as_str().unwrap_or("?"),
+                res["chatName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+        MessageAction::Edit {
+            message,
+            text,
+            chat,
+            stdin,
+            markdown,
+            html,
+            write,
+        } => {
+            let body = read_text_arg(text, stdin)?;
+            let format = if html {
+                BodyFormat::Html
+            } else if markdown {
+                BodyFormat::Markdown
+            } else {
+                BodyFormat::Plain
+            };
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.edit_message(
+                archive,
+                &principal,
+                EditMessageRequest {
+                    chat,
+                    message_id: message,
+                    text: body,
+                    format,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would edit message {} in {}.",
+                    res["messageId"].as_str().unwrap_or(""),
+                    res["chatName"].as_str().unwrap_or("")
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Edited message {} in {} ({}).",
+                res["messageId"].as_str().unwrap_or(""),
+                res["chatName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+        MessageAction::Delete { message, chat, write } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.delete_message(
+                archive,
+                &principal,
+                MessageActionRequest {
+                    chat,
+                    message_id: message,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would delete message {} in {}.",
+                    res["messageId"].as_str().unwrap_or(""),
+                    res["chatName"].as_str().unwrap_or("")
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Deleted message {} in {} ({}).",
+                res["messageId"].as_str().unwrap_or(""),
+                res["chatName"].as_str().unwrap_or(""),
+                res["conversationId"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+        MessageAction::React {
+            message,
+            reaction,
+            chat,
+            flags,
+        } => run_message_react(&live, &principal, message, reaction, chat, flags, true),
+        MessageAction::Unreact {
+            message,
+            reaction,
+            chat,
+            flags,
+        } => run_message_react(&live, &principal, message, reaction, chat, flags, false),
+        MessageAction::Pin { message, chat, flags } => run_message_pin(&live, &principal, message, chat, flags, true),
+        MessageAction::Unpin { message, chat, flags } => {
+            run_message_pin(&live, &principal, message, chat, flags, false)
+        }
+        MessageAction::Save { message, chat, flags } => run_message_save(&live, &principal, message, chat, flags, true),
+        MessageAction::Unsave { message, chat, flags } => {
+            run_message_save(&live, &principal, message, chat, flags, false)
+        }
+        MessageAction::Forward {
+            message,
+            to_chat,
+            from_chat,
+            comment,
+            markdown,
+            idempotency_key,
+            write,
+        } => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.forward_message(
+                archive,
+                &principal,
+                ForwardMessageRequest {
+                    from_chat,
+                    message_id: message,
+                    to_chat,
+                    comment: comment.unwrap_or_default(),
+                    format: if markdown {
+                        BodyFormat::Markdown
+                    } else {
+                        BodyFormat::Plain
+                    },
+                    idempotency_key,
+                    dry_run: write.is_dry_run(),
+                },
+            )?;
+            if write.json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would forward message {} to {}.",
+                    res["fromMessageId"].as_str().unwrap_or(""),
+                    res["toChatName"].as_str().unwrap_or("")
+                );
+                println!("Re-run with {}=1 and --yes to execute.", policy::ENABLE_WRITES_ENV);
+                return Ok(0);
+            }
+            println!(
+                "Forwarded message {} to {} ({}) as {}.",
+                res["fromMessageId"].as_str().unwrap_or(""),
+                res["toChatName"].as_str().unwrap_or(""),
+                res["toConversationId"].as_str().unwrap_or(""),
+                res["messageId"].as_str().unwrap_or("?")
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn run_message_react(
+    live: &LiveService,
+    principal: &Principal,
+    message: String,
+    reaction: String,
+    chat: Option<String>,
+    flags: LightWriteArgs,
+    add: bool,
+) -> Result<i32, CliError> {
+    let conn = open_optional_archive()?;
+    let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+    let res = live.react_message(
+        archive,
+        principal,
+        ReactMessageRequest {
+            chat,
+            message_id: message,
+            reaction,
+            add,
+            dry_run: flags.dry_run,
+        },
+    )?;
+    if flags.json {
+        fmt::print_json(&res);
+        return Ok(0);
+    }
+    let verb = if add { "Reacted" } else { "Removed reaction" };
+    if res["dryRun"].as_bool().unwrap_or(false) {
+        println!(
+            "[dry run] Would {} '{}' on message {}.",
+            if add { "add" } else { "remove" },
+            res["reaction"].as_str().unwrap_or(""),
+            res["messageId"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{verb} '{}' on message {} in {}.",
+            res["reaction"].as_str().unwrap_or(""),
+            res["messageId"].as_str().unwrap_or(""),
+            res["chatName"].as_str().unwrap_or("")
+        );
+    }
+    Ok(0)
+}
+
+fn run_message_pin(
+    live: &LiveService,
+    principal: &Principal,
+    message: String,
+    chat: Option<String>,
+    flags: LightWriteArgs,
+    pin: bool,
+) -> Result<i32, CliError> {
+    let conn = open_optional_archive()?;
+    let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+    let res = live.pin_message(
+        archive,
+        principal,
+        MessageActionRequest {
+            chat,
+            message_id: message,
+            dry_run: flags.dry_run,
+        },
+        pin,
+    )?;
+    if flags.json {
+        fmt::print_json(&res);
+        return Ok(0);
+    }
+    let verb = if pin { "Pinned" } else { "Unpinned" };
+    if res["dryRun"].as_bool().unwrap_or(false) {
+        println!(
+            "[dry run] Would {} message {}.",
+            if pin { "pin" } else { "unpin" },
+            res["messageId"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{verb} message {} in {}.",
+            res["messageId"].as_str().unwrap_or(""),
+            res["chatName"].as_str().unwrap_or("")
+        );
+    }
+    Ok(0)
+}
+
+fn run_message_save(
+    live: &LiveService,
+    principal: &Principal,
+    message: String,
+    chat: Option<String>,
+    flags: LightWriteArgs,
+    save: bool,
+) -> Result<i32, CliError> {
+    let conn = open_optional_archive()?;
+    let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+    let res = live.save_message(
+        archive,
+        principal,
+        MessageActionRequest {
+            chat,
+            message_id: message,
+            dry_run: flags.dry_run,
+        },
+        save,
+    )?;
+    if flags.json {
+        fmt::print_json(&res);
+        return Ok(0);
+    }
+    let verb = if save { "Saved" } else { "Unsaved" };
+    if res["dryRun"].as_bool().unwrap_or(false) {
+        println!(
+            "[dry run] Would {} message {}.",
+            if save { "save" } else { "unsave" },
+            res["messageId"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "{verb} message {} in {}.",
+            res["messageId"].as_str().unwrap_or(""),
+            res["chatName"].as_str().unwrap_or("")
+        );
+    }
+    Ok(0)
+}
+
+fn run_file(action: FileAction) -> Result<i32, CliError> {
+    match action {
+        FileAction::List {
+            query,
+            chat,
+            kind,
+            file_type,
+            time,
+            sender,
+            limit,
+            json,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            api::require_data(&conn)?;
+            let q = query.join(" ");
+            let q_opt = if q.is_empty() { None } else { Some(q.as_str()) };
+            let r = api::attachments(
+                &conn,
+                q_opt,
+                chat.as_deref(),
+                sender.as_deref(),
+                kind.as_deref(),
+                file_type.as_deref(),
+                time.since.as_deref(),
+                time.until.as_deref(),
+                limit,
+            )?;
+            if json {
+                fmt::print_json(&r);
+                return Ok(0);
+            }
+            let atts = r["attachments"].as_array().cloned().unwrap_or_default();
+            for x in &atts {
+                let where_s = x["chatName"].as_str().or(x["chatId"].as_str()).unwrap_or("?");
+                let k = x["kind"].as_str().unwrap_or("");
+                let u = x["url"].as_str().unwrap_or("");
+                let n = x["name"].as_str().unwrap_or("");
+                let name = if k == "image" || n == u || n.is_empty() {
+                    String::new()
+                } else {
+                    format!("{n}  ")
+                };
+                let gone = if x["messageDeleted"].as_bool().unwrap_or(false) {
+                    "  (message deleted)"
+                } else {
+                    ""
+                };
+                println!(
+                    "[{}] {}  @ {where_s}{gone}\n    [{k}] {name}{u}",
+                    short(x["timeMs"].as_i64()),
+                    x["sender"].as_str().filter(|s| !s.is_empty()).unwrap_or("?")
+                );
+                if let Some(lp) = x["localPath"].as_str() {
+                    println!("    [local] {lp}");
+                }
+            }
+            let hint = if r["truncated"].as_bool().unwrap_or(false) {
+                " (use --limit 0 for all)"
+            } else {
+                ""
+            };
+            println!("\n# {} of {} files{hint}", atts.len(), r["matched"]);
+            fmt::note_senders(r.get("senders"), sender.as_deref());
+            Ok(0)
+        }
+        FileAction::Fetch {
+            target,
+            message,
+            index,
+            out,
+            force_download,
+            max_bytes,
+            json,
+        } => {
+            let joined = target.join(" ");
+            let t_opt = if joined.trim().is_empty() {
+                None
+            } else {
+                Some(joined.trim())
+            };
+            if t_opt.is_none() && message.is_none() {
+                return Err(CliError::Api(api::ApiError::bad(
+                    "bad_param",
+                    "Provide a URL, message id, filename query, or --message MSG_ID.",
+                )));
+            }
+            let is_url = t_opt
+                .map(|t| {
+                    let l = t.to_ascii_lowercase();
+                    l.starts_with("https://") || l.starts_with("http://")
+                })
+                .unwrap_or(false);
+            let conn = if is_url {
+                open_optional_archive()?
+            } else {
+                let c = api::open_archive_readonly()?;
+                api::require_data(&c)?;
+                Some(c)
+            };
+            let res = fetch::fetch_attachment_with_limit(
+                conn.as_ref(),
+                t_opt,
+                message.as_deref(),
+                index,
+                out.as_deref(),
+                force_download,
+                max_bytes,
+            )
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+            if json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            println!(
+                "{}  ({} bytes, {}, {})",
+                res["path"].as_str().unwrap_or(""),
+                res["sizeBytes"],
+                res["contentType"].as_str().unwrap_or(""),
+                res["source"].as_str().unwrap_or("")
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn run_presence(action: Option<PresenceAction>, top_json: bool) -> Result<i32, CliError> {
+    let live = LiveService::default();
+    let principal = Principal::cli();
+    match action {
+        None => {
+            let res = live.get_presence(ArchiveSource::None, &principal, &[])?;
+            if top_json {
+                fmt::print_json(&res);
+            } else {
+                println!(
+                    "{} ({})",
+                    res["availability"].as_str().unwrap_or("Unknown"),
+                    res["activity"].as_str().unwrap_or("Unknown")
+                );
+            }
+            Ok(0)
+        }
+        Some(PresenceAction::Get { person, json }) => {
+            let conn = open_optional_archive()?;
+            let archive = conn.as_ref().map_or(ArchiveSource::None, ArchiveSource::Conn);
+            let res = live.get_presence(archive, &principal, &person)?;
+            if json || top_json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["self"].as_bool().unwrap_or(false) {
+                println!(
+                    "{} ({})",
+                    res["availability"].as_str().unwrap_or("Unknown"),
+                    res["activity"].as_str().unwrap_or("Unknown")
+                );
+            } else {
+                for p in res["presence"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<30}  {:<15}  ({})",
+                        p["name"].as_str().unwrap_or("?"),
+                        p["availability"].as_str().unwrap_or("Unknown"),
+                        p["activity"].as_str().unwrap_or("Unknown")
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Some(PresenceAction::Set {
+            availability,
+            expires,
+            flags,
+        }) => {
+            let res = live.set_presence(&principal, &availability, expires.as_deref(), flags.dry_run)?;
+            if flags.json || top_json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            if res["dryRun"].as_bool().unwrap_or(false) {
+                println!(
+                    "[dry run] Would set presence to {}.",
+                    res["availability"].as_str().unwrap_or("")
+                );
+            } else {
+                println!("Presence set to {}.", res["availability"].as_str().unwrap_or(""));
+            }
+            Ok(0)
+        }
+        Some(PresenceAction::Message { action: ma }) => match ma {
+            PresenceMessageAction::Set {
+                message,
+                expires,
+                flags,
+            } => {
+                let text = message.join(" ");
+                let res = live.set_status_message(&principal, Some(&text), false, expires.as_deref(), flags.dry_run)?;
+                if flags.json || top_json {
+                    fmt::print_json(&res);
+                    return Ok(0);
+                }
+                if res["dryRun"].as_bool().unwrap_or(false) {
+                    println!("[dry run] Would set status message to {}.", Quoted(&text));
+                } else {
+                    println!("Status message set to {}.", Quoted(&text));
+                }
+                Ok(0)
+            }
+            PresenceMessageAction::Clear { flags } => {
+                let res = live.set_status_message(&principal, None, true, None, flags.dry_run)?;
+                if flags.json || top_json {
+                    fmt::print_json(&res);
+                    return Ok(0);
+                }
+                if res["dryRun"].as_bool().unwrap_or(false) {
+                    println!("[dry run] Would clear status message.");
+                } else {
+                    println!("Cleared status message.");
+                }
+                Ok(0)
+            }
+        },
+    }
+}
+
+fn run_archive(action: ArchiveAction) -> Result<i32, CliError> {
+    match action {
+        ArchiveAction::Verify { file, no_backups, json } => {
+            let target = file.as_deref().map(paths::expanduser);
+            let res = backups::verify_archive(None, target.as_deref(), !no_backups);
+            let ok = res["ok"].as_bool().unwrap_or(false);
+            if json {
+                fmt::print_json(&res);
+                return Ok(if ok { 0 } else { 1 });
+            }
+            let label = res["target"].as_str().or(res["archive"].as_str()).unwrap_or("");
+            println!("{}  {label}", if ok { "OK" } else { "FAILED" });
+            if let Some(ch) = res["checks"].as_object() {
+                for (k, v) in ch {
+                    let s = if let Some(b) = v.as_bool() {
+                        if b {
+                            "ok".to_string()
+                        } else {
+                            "FAILED".to_string()
+                        }
+                    } else if let Some(rows) = v.get("rows").and_then(|x| x.as_u64()) {
+                        let bad = v.get("bad").and_then(|x| x.as_u64()).unwrap_or(0);
+                        if bad > 0 {
+                            format!("{rows} versions decode, {bad} do not")
+                        } else {
+                            format!("{rows} versions decode")
+                        }
+                    } else {
+                        v.to_string()
+                    };
+                    println!("  {k:<24} {s}");
+                }
+            }
+            if let Some(bks) = res["backups"].as_array().filter(|b| !b.is_empty()) {
+                let good = bks.iter().filter(|b| b["ok"].as_bool().unwrap_or(false)).count();
+                println!("  backups                  {good} of {} pass quick_check", bks.len());
+            }
+            for e in res["errors"].as_array().into_iter().flatten() {
+                if let Some(s) = e.as_str() {
+                    eprintln!("! {s}");
+                }
+            }
+            Ok(if ok { 0 } else { 1 })
+        }
+        ArchiveAction::Restore {
+            backup,
+            yes,
+            no_safety_backup,
+            json,
+        } => {
+            let bpath = paths::expanduser(&backup);
+            if yes {
+                let name = bpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !bpath.is_file() {
+                    return Err(CliError::Runtime(format!(
+                        "{} failed verification: file does not exist",
+                        bpath.display()
+                    )));
+                }
+                if !(name.ends_with(".sqlite3") || name.ends_with(".sqlite3.xz")) {
+                    return Err(CliError::Runtime(format!(
+                        "{} failed verification: not a .sqlite3 or .sqlite3.xz backup",
+                        bpath.display()
+                    )));
+                }
+                return restore_now(&bpath, no_safety_backup, json);
+            }
+            let check = backups::verify_archive(None, Some(&bpath), false);
+            if !check["ok"].as_bool().unwrap_or(false) {
+                let errs: Vec<&str> = check["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(3)
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                return Err(CliError::Runtime(format!(
+                    "{} failed verification: {}",
+                    bpath.display(),
+                    errs.join("; ")
+                )));
+            }
+            let dest = paths::archive_path().to_string_lossy().into_owned();
+            if json {
+                fmt::print_json(&json!({
+                    "dryRun": true,
+                    "backup": bpath.to_string_lossy(),
+                    "verified": true,
+                    "archive": dest,
+                }));
+                return Ok(0);
+            }
+            println!("Backup {} verified OK.", bpath.display());
+            println!("Restoring will:");
+            println!("  1. stop the background daemon, if it is running");
+            if !no_safety_backup {
+                println!(
+                    "  2. save a permanent safety backup of the current archive in {}",
+                    paths::backups_dir().display()
+                );
+            }
+            println!(
+                "  {}. replace {dest} with the backup, then restart the daemon",
+                if !no_safety_backup { 3 } else { 2 }
+            );
+            println!("Nothing has changed yet. Re-run with --yes to proceed.");
+            Ok(0)
+        }
+        ArchiveAction::Backup { out } => {
+            let conn = archive::connect(None)?;
+            let dest = if let Some(o) = out {
+                backups::backup(&conn, &paths::expanduser(&o))?
+            } else {
+                let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
+                backups::backup_if_due(&conn, 0.0)?.ok_or_else(|| CliError::Runtime("Backup skipped".to_string()))?
+            };
+            println!("Backup written: {}", dest.display());
+            Ok(0)
+        }
+        ArchiveAction::Reindex => {
+            let _lock = sync::acquire_sync_lock(120.0).map_err(|e| CliError::Runtime(e.to_string()))?;
+            let conn = archive::connect(None)?;
+            let n = archive::rerender(&conn, true)?;
+            println!("Re-rendered {n} messages from stored HTML.");
+            Ok(0)
+        }
+        ArchiveAction::Migrations { json } => {
+            let conn = api::open_archive_readonly()?;
+            let current: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let applied = migrations::history(&conn)?;
+            let pending = migrations::pending(&conn)?;
+            if json {
+                fmt::print_json(&json!({
+                    "currentVersion": current,
+                    "targetVersion": archive::SCHEMA_VERSION,
+                    "applied": applied.iter().map(|m| json!({
+                        "version": m.version,
+                        "name": m.name,
+                        "appliedAt": iso((m.applied_at != 0).then_some(m.applied_at)),
+                        "appliedAtMs": m.applied_at,
+                        "appVersion": m.app_version,
+                        "durationMs": m.duration_ms,
+                    })).collect::<Vec<_>>(),
+                    "pending": pending.iter().map(|m| json!({
+                        "version": m.version,
+                        "name": m.name,
+                        "description": m.description,
+                    })).collect::<Vec<_>>(),
+                }));
+                return Ok(0);
+            }
+            println!("Schema version: v{current} (target v{})", archive::SCHEMA_VERSION);
+            for m in &applied {
+                let when = if m.applied_at == 0 {
+                    "backfill".to_string()
+                } else {
+                    short(Some(m.applied_at))
+                };
+                println!(
+                    "  v{:<3} {:<44} {:<16} app={} ({}ms)",
+                    m.version, m.name, when, m.app_version, m.duration_ms
+                );
+            }
+            if !pending.is_empty() {
+                println!("\nPending:");
+                for m in &pending {
+                    println!("  v{:<3} {:<44} {}", m.version, m.name, m.description);
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn run_daemon(action: DaemonAction) -> Result<i32, CliError> {
+    match action {
+        DaemonAction::Install {
+            interval,
+            port,
+            allow_writes,
+        } => {
+            if allow_writes {
+                session::preflight_keychain().map_err(CliError::Runtime)?;
+            }
+            let path = launchd::install(interval, port, allow_writes).map_err(CliError::Runtime)?;
+            println!(
+                "Installed {}\nThe daemon checks for updates every {} and serves http://127.0.0.1:{} (writes={allow_writes})",
+                path.display(),
+                interval_label(interval),
+                port.unwrap_or_else(paths::port)
+            );
+            println!("Logs: {}", paths::log_dir().display());
+            Ok(0)
+        }
+        DaemonAction::Uninstall => {
+            println!(
+                "{}",
+                if launchd::uninstall() {
+                    "Removed."
+                } else {
+                    "Not installed."
+                }
+            );
+            Ok(0)
+        }
+        DaemonAction::Restart => {
+            let path = launchd::restart().map_err(CliError::Runtime)?;
+            println!("Restarted {}.", path.display());
+            Ok(0)
+        }
+        DaemonAction::Status => {
+            fmt::print_json(&launchd::status());
+            Ok(0)
+        }
+        DaemonAction::Logs { lines, follow } => {
+            let log_path = paths::log_dir().join("daemon.log");
+            tail_daemon_log(&log_path, lines, follow).map_err(CliError::Runtime)?;
+            Ok(0)
+        }
+        DaemonAction::Run {
+            port,
+            interval,
+            no_sync,
+            allow_writes,
+            log_stderr,
+        } => {
+            daemon::serve(port, interval, !no_sync, allow_writes, !log_stderr).map_err(CliError::Runtime)?;
+            Ok(0)
+        }
+    }
+}
+
+fn run_token(action: TokenAction) -> Result<i32, CliError> {
+    match action {
+        TokenAction::Create {
+            name,
+            scope,
+            chats,
+            expires,
+            json,
+        } => {
+            let mut parsed_scopes = Vec::new();
+            for s in &scope {
+                let parsed = Scope::parse(s).map_err(|e| CliError::Api(api::ApiError::bad("bad_param", e)))?;
+                parsed_scopes.push(parsed);
+            }
+            if parsed_scopes.is_empty() {
+                parsed_scopes.push(Scope::Read);
+            }
+            let allow_chats = if chats.is_empty() {
+                None
+            } else {
+                if !parsed_scopes.iter().any(Scope::is_chat_targeted) {
+                    return Err(CliError::Api(api::ApiError::bad(
+                        "bad_param",
+                        "`--chats` restricts live chat actions (`send`, `modify`, `react`, `mark-read`, `chat:manage`); archive reads are not chat-filtered.",
+                    )));
+                }
+                let conn = open_optional_archive()?;
+                let mut ids = Vec::with_capacity(chats.len());
+                for ch in &chats {
+                    let (resolved, _) = resolve::resolve_chat(conn.as_ref(), ch, Strictness::Strict)
+                        .map_err(|e| CliError::Live(LiveError::from(e)))?;
+                    ids.push(resolved.id);
+                }
+                Some(ids)
+            };
+            let res = daemon::create_named_token(&name, expires.as_deref(), &parsed_scopes, allow_chats)
+                .map_err(CliError::Runtime)?;
+            if json {
+                fmt::print_json(&res);
+            } else {
+                println!("{}", res["token"].as_str().unwrap_or(""));
+                let exp = res["expiresAt"].as_str().unwrap_or("never");
+                let scopes_s: Vec<&str> = res["scopes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let chats_s: Vec<&str> = res["allowChats"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let chats_note = if chats_s.is_empty() {
+                    String::new()
+                } else {
+                    format!(", chats: {}", chats_s.join(","))
+                };
+                eprintln!(
+                    "# Created token {} (id {}, scopes: {}{}, expires: {}). Save it now; only its SHA-256 hash is stored.",
+                    Quoted(res["name"].as_str().unwrap_or("")),
+                    res["id"].as_str().unwrap_or(""),
+                    scopes_s.join(","),
+                    chats_note,
+                    exp
+                );
+            }
+            Ok(0)
+        }
+        TokenAction::List { include_expired, json } => {
+            let res = daemon::list_named_tokens(include_expired).map_err(CliError::Runtime)?;
+            if json {
+                fmt::print_json(&res);
+                return Ok(0);
+            }
+            let tokens = res["tokens"].as_array().cloned().unwrap_or_default();
+            if tokens.is_empty() {
+                println!("No named tokens. Create one with `teams token create <name>`.");
+                return Ok(0);
+            }
+            for t in &tokens {
+                let exp = t["expiresAt"].as_str().unwrap_or("never");
+                let state = if t["expired"].as_bool().unwrap_or(false) {
+                    "expired"
+                } else {
+                    "active"
+                };
+                let scopes_s: Vec<&str> = t["scopes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let chats_s: Vec<&str> = t["allowChats"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let chats_col = if chats_s.is_empty() {
+                    String::new()
+                } else {
+                    format!("  chats={}", chats_s.join(","))
+                };
+                println!(
+                    "{}  {:<18}  {:<12}  {:<7}  scopes={:<24}  expires {}{}",
+                    t["id"].as_str().unwrap_or(""),
+                    t["name"].as_str().unwrap_or(""),
+                    t["prefix"].as_str().unwrap_or(""),
+                    state,
+                    scopes_s.join(","),
+                    exp,
+                    chats_col
+                );
+            }
+            Ok(0)
+        }
+        TokenAction::Revoke { target, json } => {
+            let res = daemon::revoke_named_token(&target).map_err(CliError::Runtime)?;
+            if json {
+                fmt::print_json(&res);
+            } else {
+                println!(
+                    "Revoked token {} (id {}).",
+                    Quoted(res["name"].as_str().unwrap_or("")),
+                    res["id"].as_str().unwrap_or("")
+                );
+            }
+            Ok(0)
+        }
+        TokenAction::Prune { json } => {
+            let res = daemon::prune_expired_tokens().map_err(CliError::Runtime)?;
+            if json {
+                fmt::print_json(&res);
+            } else {
+                println!(
+                    "Pruned {} expired token(s) ({} remaining).",
+                    res["pruned"], res["remaining"]
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn run_debug(action: DebugAction) -> Result<i32, CliError> {
+    match action {
+        DebugAction::Records {
+            source,
+            key,
+            since,
+            all_versions,
+            limit,
+            json,
+        } => {
+            let conn = api::open_archive_readonly()?;
+            match source {
+                None => {
+                    let r = api::record_sources(&conn)?;
+                    if json {
+                        fmt::print_json(&r);
+                    } else if let Some(srcs) = r["sources"].as_array() {
+                        for s in srcs {
+                            println!(
+                                "{:<58} {:>6} records {:>7} versions  last {}",
+                                s["source"].as_str().unwrap_or(""),
+                                s["records"].as_i64().unwrap_or(0),
+                                s["versions"].as_i64().unwrap_or(0),
+                                s["lastCaptured"].as_str().unwrap_or("-")
+                            );
+                        }
+                    }
+                    Ok(0)
+                }
+                Some(src) => {
+                    let r = api::records(&conn, &src, key.as_deref(), since.as_deref(), limit, all_versions)?;
+                    if let Some(recs) = r["records"].as_array() {
+                        for rec in recs {
+                            println!("{}", json_codec::to_string(rec));
+                        }
+                    }
+                    Ok(0)
+                }
+            }
+        }
+        DebugAction::Stores => {
+            let cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            for name in cache.database_names() {
+                println!("{name}\n    {}", cache.stores(&name).join(", "));
+            }
+            Ok(0)
+        }
+        DebugAction::Dump { db, store } => {
+            let mut cache = TeamsCache::open::<fn() -> Result<(), crate::ingest::SourceError>>(None, None)
+                .map_err(|e| CliError::Runtime(e.to_string()))?;
+            let matches: Vec<String> = cache.database_names().into_iter().filter(|n| n.contains(&db)).collect();
+            let Some(first_db) = matches.first() else {
+                eprintln!("No database name contains {}", Quoted(&db));
+                return Ok(2);
+            };
+            let stores = cache.stores(first_db);
+            if !stores.iter().any(|s| s == &store) {
+                let avail = if stores.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    stores.join(", ")
+                };
+                eprintln!("No store {} in {first_db}. Stores: {avail}", Quoted(&store));
+                return Ok(2);
+            }
+            for (k, v) in cache.raw_records_with_keys(first_db, &store) {
+                println!("{}", json_codec::to_string(&json!({"key": k, "value": v})));
             }
             Ok(0)
         }

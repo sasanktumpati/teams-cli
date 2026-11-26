@@ -2,7 +2,11 @@ use crate::daemon;
 use crate::identity;
 use crate::ingest::extract::{Attachment, Conversation, Message, Person, RawRecord, Snapshot};
 use crate::ingest::render;
-use crate::live::{auth, fetch, onedrive, send};
+use crate::live::compose::{BodyFormat, Importance};
+use crate::live::policy::{self, Principal};
+use crate::live::service::messages::SendMessageRequest;
+use crate::live::service::{ArchiveSource, LiveService};
+use crate::live::{cookies, fetch, local_onedrive, session};
 use crate::query::{api, export, views};
 use crate::storage::{archive, backups};
 use crate::timeutil;
@@ -352,20 +356,20 @@ fn test_auth_cookies_onedrive_fetch_and_restricted_send() {
     let td = tempfile::tempdir().unwrap();
     std::env::set_var("TEAMS_CLI_HOME", td.path());
     std::env::set_var("TEAMS_CLI_ONEDRIVE_DIR", td.path().join("od"));
-    std::env::remove_var(send::ENABLE_ENV);
-    std::env::remove_var(send::ALLOWLIST_ENV);
+    std::env::remove_var(policy::ENABLE_WRITES_ENV);
+    std::env::remove_var(policy::ALLOWLIST_ENV);
 
     let pw = "test-safe-storage-secret";
-    let key = auth::derive_aes_key(pw);
-    let enc = auth::encrypt_cookie_value("secret-token-123", ".asm.skype.com", pw, 24);
+    let key = cookies::derive_aes_key(pw);
+    let enc = cookies::encrypt_cookie_value("secret-token-123", ".asm.skype.com", pw, 24);
     assert_eq!(
-        auth::decrypt_cookie_value(&enc, ".asm.skype.com", &key, 24, "").unwrap(),
+        cookies::decrypt_cookie_value(&enc, ".asm.skype.com", &key, 24, "").unwrap(),
         "secret-token-123"
     );
-    assert!(auth::decrypt_cookie_value(&enc, ".sharepoint.com", &key, 24, "").is_err());
+    assert!(cookies::decrypt_cookie_value(&enc, ".sharepoint.com", &key, 24, "").is_err());
 
-    let cookies = vec![
-        auth::Cookie {
+    let cks = vec![
+        cookies::Cookie {
             host_key: ".asm.skype.com".into(),
             name: "skypetoken_asm".into(),
             value: "TOK".into(),
@@ -373,7 +377,7 @@ fn test_auth_cookies_onedrive_fetch_and_restricted_send() {
             expires_utc: 0,
             partitioned: false,
         },
-        auth::Cookie {
+        cookies::Cookie {
             host_key: ".evil.com".into(),
             name: "x".into(),
             value: "BAD".into(),
@@ -383,14 +387,14 @@ fn test_auth_cookies_onedrive_fetch_and_restricted_send() {
         },
     ];
     assert_eq!(
-        auth::build_cookie_header(&cookies, "https://us-api.asm.skype.com/v1/x", None),
+        cookies::build_cookie_header(&cks, "https://us-api.asm.skype.com/v1/x", None),
         "skypetoken_asm=TOK"
     );
     assert_eq!(
-        auth::build_cookie_header(&cookies, "http://us-api.asm.skype.com/v1/x", None),
+        cookies::build_cookie_header(&cks, "http://us-api.asm.skype.com/v1/x", None),
         ""
     );
-    assert_eq!(auth::build_cookie_header(&cookies, "https://evil.com/steal", None), "");
+    assert_eq!(cookies::build_cookie_header(&cks, "https://evil.com/steal", None), "");
 
     assert_eq!(
         fetch::rewrite_download_url("https://contoso.sharepoint.com/:x:/g/personal/doc"),
@@ -400,16 +404,16 @@ fn test_auth_cookies_onedrive_fetch_and_restricted_send() {
     let od = td.path().join("od");
     std::fs::create_dir_all(&od).unwrap();
     std::fs::write(od.join("Plan.pdf"), b"pdf").unwrap();
-    assert!(onedrive::find_onedrive_file("Plan.pdf", None).is_some());
-    assert!(onedrive::find_onedrive_file("../Plan.pdf", None).is_none());
-    assert!(onedrive::find_onedrive_file("/etc/passwd", None).is_none());
+    assert!(local_onedrive::find_onedrive_file("Plan.pdf", None).is_some());
+    assert!(local_onedrive::find_onedrive_file("../Plan.pdf", None).is_none());
+    assert!(local_onedrive::find_onedrive_file("/etc/passwd", None).is_none());
 
     let hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
     let pay = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(r#"{"rgn":"amer","exp":2000000000,"skypeid":"u1","tid":"t1"}"#);
     let jwt = format!("{hdr}.{pay}.sig");
-    let tok = auth::load_skypetoken(
-        Some(&[auth::Cookie {
+    let tok = session::load_skypetoken(
+        Some(&[cookies::Cookie {
             host_key: ".asm.skype.com".into(),
             name: "skypetoken_asm".into(),
             value: jwt,
@@ -422,21 +426,54 @@ fn test_auth_cookies_onedrive_fetch_and_restricted_send() {
     .unwrap();
     assert_eq!(tok.region, "amer");
 
-    let dry = send::send_message(
-        None,
-        "48:notes",
-        "Hello <world> & friends",
-        None,
-        false,
-        Some("12345"),
-        true,
-    )
-    .unwrap();
+    let live = LiveService::default();
+    let cli_p = Principal::cli();
+    let dry = live
+        .send_message(
+            ArchiveSource::None,
+            &cli_p,
+            SendMessageRequest {
+                target: "48:notes".into(),
+                text: "Hello <world> & friends".into(),
+                format: BodyFormat::Plain,
+                reply_to: None,
+                quote: None,
+                subject: None,
+                importance: Importance::Normal,
+                mentions: Vec::new(),
+                images: Vec::new(),
+                files: Vec::new(),
+                client_message_id: Some("12345".into()),
+                idempotency_key: None,
+                dry_run: true,
+            },
+        )
+        .unwrap();
     assert_eq!(dry["dryRun"], true);
     assert_eq!(dry["restricted"], true);
     assert_eq!(dry["content"], "<p>Hello &lt;world&gt; &amp; friends</p>");
-    let err = send::send_message(None, "48:notes", "hi", None, false, None, false).unwrap_err();
-    assert!(err.0.contains(send::ENABLE_ENV));
+    let err = live
+        .send_message(
+            ArchiveSource::None,
+            &cli_p,
+            SendMessageRequest {
+                target: "48:notes".into(),
+                text: "hi".into(),
+                format: BodyFormat::Plain,
+                reply_to: None,
+                quote: None,
+                subject: None,
+                importance: Importance::Normal,
+                mentions: Vec::new(),
+                images: Vec::new(),
+                files: Vec::new(),
+                client_message_id: None,
+                idempotency_key: None,
+                dry_run: false,
+            },
+        )
+        .unwrap_err();
+    assert!(err.message.contains(policy::ENABLE_WRITES_ENV));
 }
 
 #[test]

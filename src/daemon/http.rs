@@ -3,15 +3,16 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_DRAIN_BODY_BYTES: usize = 64 * 1024;
 const MAX_HEADER_DURATION: Duration = Duration::from_secs(3);
-const MAX_BODY_DRAIN_DURATION: Duration = Duration::from_secs(2);
 const MAX_WRITE_DURATION: Duration = Duration::from_secs(5);
 
 pub struct HttpRequest {
     pub method: String,
     pub target: String,
     pub headers: Vec<(String, String)>,
+    content_length: usize,
+    buffered_body: Vec<u8>,
+    expect_continue: bool,
     stream: TcpStream,
 }
 
@@ -39,6 +40,67 @@ impl HttpRequest {
             .filter(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
             .collect()
+    }
+
+    pub fn first_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn content_length(&self) -> usize {
+        self.content_length
+    }
+
+    pub fn read_body(&mut self, max_bytes: usize, timeout: Duration) -> Result<Vec<u8>, (u16, &'static str)> {
+        if self.content_length > max_bytes {
+            return Err((413, "Request body too large"));
+        }
+        if self.content_length == 0 {
+            return Ok(Vec::new());
+        }
+        if self.buffered_body.len() >= self.content_length {
+            let mut body = std::mem::take(&mut self.buffered_body);
+            body.truncate(self.content_length);
+            return Ok(body);
+        }
+        if self.expect_continue {
+            let _ = write_all_with_deadline(
+                &mut self.stream,
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                Instant::now() + Duration::from_secs(2),
+            );
+            let _ = self.stream.flush();
+            self.expect_continue = false;
+        }
+        let mut body = Vec::with_capacity(self.content_length);
+        body.extend_from_slice(&self.buffered_body);
+        self.buffered_body.clear();
+        let mut remaining = self.content_length - body.len();
+        let deadline = Instant::now() + timeout;
+        let mut chunk = [0u8; 8192];
+        while remaining > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err((408, "Request body timeout"));
+            }
+            let _ = self.stream.set_read_timeout(Some(deadline - now));
+            let want = remaining.min(chunk.len());
+            match self.stream.read(&mut chunk[..want]) {
+                Ok(0) => return Err((400, "Truncated request body")),
+                Ok(n) => {
+                    body.extend_from_slice(&chunk[..n]);
+                    remaining -= n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    return Err((408, "Request body timeout"));
+                }
+                Err(_) => return Err((400, "Failed reading request body")),
+            }
+        }
+        Ok(body)
     }
 
     pub fn respond(mut self, status: u16, headers: &[(&str, &str)], body: &[u8]) {
@@ -110,7 +172,7 @@ fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-pub fn read_request(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
+pub fn read_request_head(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
     let _ = stream.set_nodelay(true);
 
     let deadline = Instant::now() + MAX_HEADER_DURATION;
@@ -150,8 +212,6 @@ pub fn read_request(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
     };
 
     let head_bytes = &buf[..header_end];
-    let already_read_body = buf.len().saturating_sub(body_start);
-
     let head_str = match std::str::from_utf8(head_bytes) {
         Ok(s) => s,
         Err(_) => {
@@ -176,6 +236,7 @@ pub fn read_request(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
 
     let mut headers = Vec::new();
     let mut content_length: Option<usize> = None;
+    let mut expect_continue = false;
     for line in lines {
         if line.is_empty() || line.starts_with([' ', '\t']) {
             let _ = write_plain_error(&mut stream, 400, "Malformed HTTP header");
@@ -193,6 +254,9 @@ pub fn read_request(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
         if k.eq_ignore_ascii_case("Transfer-Encoding") {
             let _ = write_plain_error(&mut stream, 501, "Transfer-Encoding is not supported");
             return Ok(None);
+        }
+        if k.eq_ignore_ascii_case("Expect") && val.eq_ignore_ascii_case("100-continue") {
+            expect_continue = true;
         }
         if k.eq_ignore_ascii_case("Content-Length") {
             if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
@@ -216,33 +280,19 @@ pub fn read_request(mut stream: TcpStream) -> io::Result<Option<HttpRequest>> {
     }
 
     let cl = content_length.unwrap_or(0);
-    if cl > MAX_DRAIN_BODY_BYTES {
-        let _ = write_plain_error(&mut stream, 413, "Request body too large");
-        return Ok(None);
-    }
-    if cl > already_read_body {
-        let mut remaining = cl - already_read_body;
-        let body_deadline = Instant::now() + MAX_BODY_DRAIN_DURATION;
-        while remaining > 0 {
-            let now = Instant::now();
-            if now >= body_deadline {
-                break;
-            }
-            let _ = stream.set_read_timeout(Some(body_deadline - now));
-            let want = remaining.min(chunk.len());
-            match stream.read(&mut chunk[..want]) {
-                Ok(0) => break,
-                Ok(n) => remaining -= n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    }
+    let buffered_body = if body_start < buf.len() {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     Ok(Some(HttpRequest {
         method: method.to_string(),
         target: target.to_string(),
         headers,
+        content_length: cl,
+        buffered_body,
+        expect_continue,
         stream,
     }))
 }
@@ -276,10 +326,12 @@ fn status_reason(status: u16) -> &'static str {
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Content Too Large",
+        415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Error",
     }

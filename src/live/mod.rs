@@ -1,5 +1,11 @@
-pub mod auth;
+pub mod clients;
+pub mod compose;
+pub mod cookies;
+pub mod error;
 pub mod fetch;
-pub mod http;
-pub mod onedrive;
-pub mod send;
+pub mod local_onedrive;
+pub mod policy;
+pub mod refs;
+pub mod service;
+pub mod session;
+pub mod transport;

@@ -1,68 +1,86 @@
-teams {version}: local, append-only SQLite archive of macOS Microsoft Teams chats.
+teams {version}: local-first SQLite archive, CLI, and scoped HTTP API for macOS Microsoft Teams.
 
 Conventions
-  --json on read commands matches the HTTP API shape.
-  Chats (--chat, messages CHAT) & people (--from) accept a name fragment, email, or id ("otherMatches"/"senders" flag ambiguity).
+  --json on commands matches the HTTP API shape.
+  Chats (--chat, chat export, msg list/send) & people (--from, --mention) accept a name fragment, email, or id.
+  Messages on live actions accept numeric MSG_ID or chatId/msgId (use --chat if a numeric id collides).
   Times (--since/--until): 30m 12h 7d 2w today yesterday 2026-11-01 2026-11-01T14:00 (local); --since all clears default 7d windows.
   --limit 0 = unlimited; "matched" is total count, "truncated": true means more exist.
   Search: prefix words, "exact phrase", OR, NOT, -exclude / -"phrase"; --relevance weights subject > body.
-  Exit codes: 0 ok, 1 runtime/archive/health error, 2 bad input. Errors go to stderr.
-  HTTP API (127.0.0.1:{port}, loopback Host only, no Origin):
-    GET /health (open); all /v1/* require `Authorization: Bearer <token>` (`teams token create <name>`).
-    GET /v1/<cmd> (camelCase flags): status, chats(query member kind), messages(chat|around context sender thread includeHistory),
-    search(query includeHistory countOnly hasAttachments sender chat sort=relevance), attachments, people, person(person),
-    changes(what=edited|deleted), records(source key allVersions), inbox, mentions(chat unreadOnly), calls(person missedOnly),
-    meetings(query), saved(includeUnsaved), pinned(chat); since/until/limit/includeEvents as in CLI. POST /v1/sync.
-    Errors: {error: {code, message}} (401 unauthorized + WWW-Authenticate: Bearer, 409 sync_busy/empty_archive, 503 migrating).
+  Exit codes: 0 ok, 1 runtime/archive/auth/policy error, 2 bad input. Errors go to stderr.
 
-JSON shapes
-  message     {id, chatId, chatName?, threadId, isReply, time, sender, senderId, kind, text, subject,
-               attachments: [{kind: file|image|link, name, url}], reactions: [{emoji, count, users}],
-               edited, editedAt, deleted, deletedAt, deletedBy, history?: [{text, editedAt, capturedAt}]}
-  attachment  {kind, name, type, url, time, sender, chatName, chatId, messageId, messageDeleted, messageText, localPath?}
-  fetch       {path, sizeBytes, contentType, url, name, kind, source: download|onedrive} (CLI only)
-  send        [RESTRICTED] CLI only; dry-run unless --yes and TEAMS_CLI_ENABLE_SEND=1 (optional TEAMS_CLI_SEND_ALLOWLIST)
-  messages    {chat, messages, matched, truncated, otherMatches, aroundMessageId?, hasBefore?, hasAfter?}
-  search      {query, chat, senders, results?: [message + snippet, chatName, matchedInHistory?], matched, truncated?, countOnly?}
-  chats       {chats: [{id, name, kind, messageCount, lastActivity}], total, memberMatches?}
-  person      {person: {id, name, email, jobTitle, department, messagesInArchive, firstContact, lastContact},
-               sharedChats, totalSharedChats, recentFiles, totalAttachments, otherMatches}
-  inbox       {me, since, unreadChats, awaitingReply, mentions, unreadActivities, counts}
-  mentions    {me, chat, mentions: [{messageId, chatId, chatName, time, sender, text, isRead}], matched, truncated}
-  calls       {calls: [{id, time, endTime, durationSeconds, direction, callType, state, participants, chatName}]}
-  meetings    {meetings: [{id, subject, start, end, organizer, myResponse, joinUrl, chatId, attendees}]}
-  saved       {saved: [{messageId, chatId, chatName, savedAt, time, sender, text, deleted, unsaved}]}
-  pinned      {chat, pinned: [{messageId, chatId, chatName, time, sender, subject, text, source}]}
-  verify      {ok, archive|target, checks, backups?, errors}
-  restore     {restoredFrom, archive, safetyBackup}
-  doctor      {ok, version, schemaVersion, checks: [{name, ok, summary, hint?}]}
-  migrations  {currentVersion, targetVersion, applied: [{version, name, appliedAt, appVersion, durationMs}], pending}
+HTTP API (127.0.0.1:{port}, loopback Host only, no Origin)
+  GET /health (open); all /v1/* require `Authorization: Bearer <token>` (`teams token create <name> --scope ...`).
+  Scopes (default: read):
+    read           GET /v1/* archive reads + GET /v1/live/status
+    sync           POST /v1/sync
+    presence:read  GET /v1/live/presence
+    presence:write POST /v1/live/presence/{set,message}
+    react          POST /v1/live/messages/{react,unreact,pin,unpin,save,unsave} + /v1/live/chats/{mute,unmute}
+    mark-read      POST /v1/live/chats/{read,unread}
+    send           POST /v1/live/messages/{send,forward}
+    modify         POST /v1/live/messages/{edit,delete}
+    chat:manage    POST /v1/live/chats/{create,rename,add-member,remove-member}
+  Daemon live writes also require `teams daemon install --allow-writes` (or `teams daemon run --allow-writes`).
+  Optional per-token chat allowlist for live chat write actions (archive reads are not chat-filtered): `teams token create <name> --scope send --chats "Engineering,48:notes"`.
+  HTTP live routes resolving chat/person names, bare messageIds, or quote/forward also require `read` scope (exact chat IDs, MRIs, and chatId/msgId work without `read`).
+  Archive GET routes (camelCase query params):
+    status, chats(query member kind includeSystem), messages(chat|around context sender thread history),
+    search(query history countOnly hasAttachments sender chat sort=relevance), files|attachments, people, person(person),
+    changes(what=edited|deleted), records(source key allVersions), inbox, mentions(chat unreadOnly), calls(person missedOnly),
+    meetings(query), saved(includeUnsaved), pinned(chat); since/until/limit/includeEvents as in CLI.
+  Live routes (Content-Type: application/json; strict schema; optional Idempotency-Key header):
+    GET  /v1/live/status
+    GET  /v1/live/presence?person=...
+    POST /v1/live/messages/{send,edit,delete,react,unreact,pin,unpin,save,unsave,forward}
+    POST /v1/live/chats/{create,rename,add-member,remove-member,read,unread,mute,unmute}
+    POST /v1/live/presence/{set,message}
+  Errors: {error: {code, message, details?}} (401 unauthorized, 403 scope_required/chat_not_allowed/writes_disabled,
+    409 sync_busy/empty_archive/ambiguous_target, 429 rate_limited, 503 migrating/live_auth_unavailable/teams_session_expired).
+
+Write Guardrails
+  High-impact CLI actions (msg send/edit/delete/forward, chat new/rename/add-member/remove-member):
+    dry-run by default unless --yes AND TEAMS_CLI_ENABLE_WRITES=1 (optional TEAMS_CLI_WRITE_ALLOWLIST).
+  Low-impact CLI actions (msg react/unreact/pin/unpin/save/unsave, chat read/unread/mute/unmute, presence set/message):
+    run directly (pass --dry-run to preview).
+  All live writes append a metadata-only JSONL audit entry (no message bodies) to write-audit.jsonl and return archiveVisible: false.
 
 Commands
   teams inbox [--since T=7d] [--limit N=30] [--json]
-  teams chats [--grep Q] [--kind chat|channel|meeting|team|community|system] [--all] [--member PERSON] [--limit N=40] [--json]
-  teams messages [chat] [--around MSG_ID] [--context N=10] [--thread ID] [--history] [--since T] [--until T] [--from PERSON] [--limit N=100] [--events] [--json]
-  teams search [query...] [--chat CHAT] [--relevance] [--include-history] [--count] [--has-attachments] [--since T] [--until T] [--from PERSON] [--limit N=30] [--events] [--json]
+  teams search [query...] [--chat CHAT] [--relevance] [--history] [--count] [--has-attachments] [--since T] [--until T] [--from PERSON] [--limit N=30] [--events] [--json]
   teams mentions [--since T] [--until T] [--chat CHAT] [--unread] [--limit N=50] [--json]
   teams changes [--since T=7d] [--until T] [--chat CHAT] [--edited] [--deleted] [--limit N=50] [--json]
-  teams attachments [query...] [--chat CHAT] [--kind file|image|link] [--type EXT] [--since T] [--until T] [--from PERSON] [--limit N=50] [--json]
-  teams people [person...] [--grep Q] [--bots] [--limit N] [--json]
+  teams chat list [--grep Q] [--kind KIND] [--all] [--member PERSON] [--limit N=40] [--json]
+  teams chat export CHAT [--since T] [--until T] [--from PERSON] [--thread ID] [--events] [--history] [--out PATH]
+  teams chat new PERSON... [--topic TOPIC] [--dry-run] [--yes] [--json]
+  teams chat rename CHAT TOPIC [--dry-run] [--yes] [--json]
+  teams chat add-member CHAT PERSON [--dry-run] [--yes] [--json]
+  teams chat remove-member CHAT PERSON [--dry-run] [--yes] [--json]
+  teams chat read|unread|mute|unmute CHAT [--dry-run] [--json]
+  teams message|msg list [CHAT] [--around MSG_ID] [--context N=10] [--thread ID] [--history] [--since T] [--until T] [--from PERSON] [--limit N=100] [--events] [--json]
+  teams message|msg saved [--include-unsaved] [--limit N=50] [--json]
+  teams message|msg pinned [--chat CHAT] [--limit N=50] [--json]
+  teams message|msg send TARGET [TEXT...] [--stdin] [--markdown|--html] [--mention PERSON]... [--quote MSG] [--reply-to ID] [--subject S] [--important|--urgent] [--image PATH]... [--file PATH]... [--client-message-id ID] [--idempotency-key KEY] [--dry-run] [--yes] [--json]
+  teams message|msg edit MSG [TEXT...] [--chat CHAT] [--stdin] [--markdown|--html] [--dry-run] [--yes] [--json]
+  teams message|msg delete MSG [--chat CHAT] [--dry-run] [--yes] [--json]
+  teams message|msg react|unreact MSG REACTION [--chat CHAT] [--dry-run] [--json]
+  teams message|msg pin|unpin|save|unsave MSG [--chat CHAT] [--dry-run] [--json]
+  teams message|msg forward MSG TO_CHAT [--from-chat CHAT] [--comment TEXT] [--markdown] [--idempotency-key KEY] [--dry-run] [--yes] [--json]
+  teams file list [QUERY...] [--chat CHAT] [--kind file|image|link] [--type EXT] [--since T] [--until T] [--from PERSON] [--limit N=50] [--json]
+  teams file fetch [TARGET...] [--message MSG_ID] [--index N] [--out PATH] [--force-download] [--max-bytes BYTES] [--json]
+  teams people [PERSON...] [--grep Q] [--bots] [--limit N] [--json]
+  teams presence [get [PERSON...]] | set available|busy|dnd|brb|away|offline|reset [--for T] | message set TEXT... [--for T] | message clear [--dry-run] [--json]
   teams calls [--since T] [--until T] [--with PERSON] [--missed] [--limit N=50] [--json]
   teams meetings [--since T] [--until T] [--grep Q] [--limit N=50] [--json]
-  teams saved [--all] [--limit N=50] [--json]
-  teams pinned [--chat CHAT] [--limit N=50] [--json]
-  teams export chat [--since T] [--until T] [--from PERSON] [--thread ID] [--events] [--history] [--out PATH]
-  teams fetch [target...] [--message MSG_ID] [--index N] [--out PATH] [--force-download] [--max-bytes BYTES] [--json]
-  teams send target [message...] [--stdin] [--reply-to MSG_ID] [--html] [--client-message-id ID] [--dry-run] [--yes] [--json]
   teams sync [--source DIR] [--force] [--json]
   teams status [--json]
   teams doctor [--json]
-  teams daemon install [--interval SEC=60] [--port PORT] | uninstall | restart | status | logs [--lines N=50] [--follow] | run [--port PORT] [--interval SEC=60] [--no-sync] [--log-stderr]
+  teams daemon install [--interval SEC=60] [--port PORT] [--allow-writes] | uninstall | restart | status | logs [--lines N=50] [--follow] | run [--port PORT] [--interval SEC=60] [--no-sync] [--allow-writes] [--log-stderr]
   teams archive backup [--out PATH] | restore BACKUP [--yes] [--no-safety-backup] [--json] | verify [FILE] [--no-backups] [--json] | reindex | migrations [--json]
-  teams token create NAME [--expires T] [--json] | list [--include-expired] [--json] | revoke TARGET [--json] | prune [--json]
+  teams token create NAME [--scope S,...] [--chats CHAT,...] [--expires T] [--json] | list [--include-expired] [--json] | revoke TARGET [--json] | prune [--json]
   teams update [--check] [--version TAG] [--force] [--json]
   teams debug records [SOURCE] [--key KEY] [--since T] [--all-versions] [--limit N=50] [--json] | stores | dump DB STORE
   teams completions bash|zsh|fish|elvish|powershell
 
 Env
-  TEAMS_CLI_HOME, TEAMS_CLI_SOURCE, TEAMS_CLI_PORT, TEAMS_CLI_FULL_SYNC=1, TEAMS_CLI_NO_UPDATE_CHECK=1, TEAMS_CLI_ENABLE_SEND=1, TEAMS_CLI_SEND_ALLOWLIST
+  TEAMS_CLI_HOME, TEAMS_CLI_SOURCE, TEAMS_CLI_PORT, TEAMS_CLI_FULL_SYNC=1, TEAMS_CLI_NO_UPDATE_CHECK=1, TEAMS_CLI_ENABLE_WRITES=1, TEAMS_CLI_WRITE_ALLOWLIST

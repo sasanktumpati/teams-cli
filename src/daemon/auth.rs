@@ -1,4 +1,5 @@
 use crate::json_codec;
+use crate::live::policy::{Principal, Scope};
 use crate::paths;
 use crate::timeutil;
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const UNAUTHORIZED_MESSAGE: &str =
     "Missing or invalid bearer token. Create one with `teams token create <name>` on this Mac.";
@@ -123,12 +124,20 @@ fn read_private_file_with_sig(path: &Path) -> Result<Option<(FileHandleSig, Stri
     Ok(Some((sig, content)))
 }
 
+fn default_scopes() -> Vec<Scope> {
+    vec![Scope::Read]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredNamedToken {
     pub id: String,
     pub name: String,
     pub prefix: String,
     pub sha256: String,
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<Scope>,
+    #[serde(default)]
+    pub allow_chats: Option<Vec<String>>,
     pub created_at_ms: i64,
     #[serde(default)]
     pub expires_at_ms: Option<i64>,
@@ -189,7 +198,7 @@ fn read_named_store(path: &Path) -> Result<(Option<FileHandleSig>, Vec<StoredNam
 
 fn write_named_store(path: &Path, tokens: &[StoredNamedToken]) -> Result<(), String> {
     let payload = TokenStoreFile {
-        version: 1,
+        version: 2,
         tokens: tokens.to_vec(),
     };
     let text = format!("{}\n", json_codec::to_pretty(&payload));
@@ -198,10 +207,13 @@ fn write_named_store(path: &Path, tokens: &[StoredNamedToken]) -> Result<(), Str
 
 fn token_metadata_json(t: &StoredNamedToken, now_ms: i64) -> Value {
     let expired = t.expires_at_ms.is_some_and(|exp| exp <= now_ms);
+    let scopes: Vec<&str> = t.scopes.iter().map(Scope::as_str).collect();
     json!({
         "id": t.id,
         "name": t.name,
         "prefix": t.prefix,
+        "scopes": scopes,
+        "allowChats": t.allow_chats,
         "createdAt": timeutil::iso(Some(t.created_at_ms)),
         "createdAtMs": t.created_at_ms,
         "expiresAt": t.expires_at_ms.and_then(|e| timeutil::iso(Some(e))),
@@ -210,9 +222,40 @@ fn token_metadata_json(t: &StoredNamedToken, now_ms: i64) -> Value {
     })
 }
 
-pub fn create_named_token(name: &str, expires: Option<&str>) -> Result<Value, String> {
+pub fn create_named_token(
+    name: &str,
+    expires: Option<&str>,
+    scopes: &[Scope],
+    allow_chats: Option<Vec<String>>,
+) -> Result<Value, String> {
     let clean_name = validate_token_name(name)?;
     let expires_at_ms = timeutil::parse_expiry(expires)?;
+    let mut normalized_scopes = Vec::new();
+    for s in scopes {
+        if !normalized_scopes.contains(s) {
+            normalized_scopes.push(*s);
+        }
+    }
+    if normalized_scopes.is_empty() {
+        normalized_scopes.push(Scope::Read);
+    }
+    let normalized_chats = match allow_chats {
+        None => None,
+        Some(list) => {
+            let mut out = Vec::new();
+            for c in list {
+                let trimmed = c.trim();
+                if !trimmed.is_empty() && !out.iter().any(|x: &String| x == trimmed) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            if out.is_empty() {
+                return Err("allow_chats cannot be empty; omit allow_chats for unrestricted chat access.".to_string());
+            }
+            Some(out)
+        }
+    };
+
     let _lock = lock_tokens_file()?;
     let path = paths::api_tokens_path();
     let (_, mut tokens) = read_named_store(&path)?;
@@ -238,6 +281,8 @@ pub fn create_named_token(name: &str, expires: Option<&str>) -> Result<Value, St
         name: clean_name,
         prefix,
         sha256: hash_hex,
+        scopes: normalized_scopes,
+        allow_chats: normalized_chats,
         created_at_ms: now_ms,
         expires_at_ms,
     };
@@ -349,11 +394,16 @@ pub fn prune_expired_tokens() -> Result<Value, String> {
     }))
 }
 
-type NamedDigest = ([u8; 32], Option<i64>);
+#[derive(Clone)]
+struct NamedDigest {
+    digest: [u8; 32],
+    expires_at_ms: Option<i64>,
+    principal: Principal,
+}
 
 struct CachedTokens {
     named_sig: Option<FileHandleSig>,
-    named: Vec<NamedDigest>,
+    named: Arc<Vec<NamedDigest>>,
 }
 
 pub(crate) struct ApiToken {
@@ -365,7 +415,7 @@ impl Default for ApiToken {
         Self {
             cached: Mutex::new(CachedTokens {
                 named_sig: None,
-                named: Vec::new(),
+                named: Arc::new(Vec::new()),
             }),
         }
     }
@@ -377,7 +427,7 @@ impl ApiToken {
         Ok(())
     }
 
-    fn refresh_if_needed(&self) -> Result<Vec<NamedDigest>, String> {
+    fn refresh_if_needed(&self) -> Result<Arc<Vec<NamedDigest>>, String> {
         let named_path = paths::api_tokens_path();
         let mut cache = self.cached.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -390,28 +440,45 @@ impl ApiToken {
                     if raw.len() == 32 {
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&raw);
-                        digests.push((arr, t.expires_at_ms));
+                        let scopes = if t.scopes.is_empty() {
+                            default_scopes()
+                        } else {
+                            t.scopes
+                        };
+                        digests.push(NamedDigest {
+                            digest: arr,
+                            expires_at_ms: t.expires_at_ms,
+                            principal: Principal {
+                                id: t.id,
+                                name: t.name,
+                                is_cli: false,
+                                scopes,
+                                allow_chats: t.allow_chats,
+                            },
+                        });
                     }
                 }
             }
             cache.named_sig = sig;
-            cache.named = digests;
+            cache.named = Arc::new(digests);
         }
 
-        Ok(cache.named.clone())
+        Ok(Arc::clone(&cache.named))
     }
 
-    pub(crate) fn verify(&self, candidate: &str) -> Result<bool, String> {
+    pub(crate) fn verify(&self, candidate: &str) -> Result<Option<Principal>, String> {
         let given = sha256_bytes(candidate);
         let named = self.refresh_if_needed()?;
         let now_ms = timeutil::now_ms();
-        let mut matched = false;
-        for (digest, expires_at_ms) in &named {
-            let active = !expires_at_ms.is_some_and(|exp| exp <= now_ms);
-            let eq = ct_eq_32(&given, digest);
-            matched |= active & eq;
+        let mut matched_idx: Option<usize> = None;
+        for (i, entry) in named.iter().enumerate() {
+            let active = !entry.expires_at_ms.is_some_and(|exp| exp <= now_ms);
+            let eq = ct_eq_32(&given, &entry.digest);
+            if active && eq {
+                matched_idx = Some(i);
+            }
         }
-        Ok(matched)
+        Ok(matched_idx.map(|i| named[i].principal.clone()))
     }
 }
 

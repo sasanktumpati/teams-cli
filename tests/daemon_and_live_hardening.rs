@@ -14,7 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use teams_cli::daemon::{self, SyncConfig, SyncRunner};
 use teams_cli::launchd;
-use teams_cli::live::{auth, fetch, http, send};
+use teams_cli::live::compose::{BodyFormat, Importance};
+use teams_cli::live::policy::{self, Principal};
+use teams_cli::live::service::messages::SendMessageRequest;
+use teams_cli::live::service::{ArchiveSource, LiveService};
+use teams_cli::live::transport::ServiceEndpoints;
+use teams_cli::live::{cookies as auth, fetch, session, transport as http};
 
 fn raw(addr: SocketAddr, request: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
@@ -360,7 +365,7 @@ fn skypetoken_falls_back_across_candidates() {
         cookie(".asm.skype.com", "skypetoken_asm", "not-a-jwt", false),
         cookie(".asm.skype.com", "skypetoken_asm", &valid_short, false),
     ];
-    let tok = auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap();
+    let tok = session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap();
     assert_eq!(tok.skype_id, "short");
     assert_eq!(tok.region, "emea");
 
@@ -369,7 +374,7 @@ fn skypetoken_falls_back_across_candidates() {
         cookie("teams.microsoft.com", "skypetoken_asm", &valid_long, false),
     ];
     assert_eq!(
-        auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
+        session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
         "long"
     );
 
@@ -378,7 +383,7 @@ fn skypetoken_falls_back_across_candidates() {
         cookie(".asm.skype.com", "skypetoken_asm", &valid_short, false),
     ];
     assert_eq!(
-        auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
+        session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
         "short"
     );
 
@@ -387,7 +392,7 @@ fn skypetoken_falls_back_across_candidates() {
         cookie(".asm.skype.com", "skypetoken_asm", &valid_long, true),
     ];
     assert_eq!(
-        auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
+        session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
         "long"
     );
 
@@ -397,18 +402,18 @@ fn skypetoken_falls_back_across_candidates() {
         cookie(".asm.skype.com", "skypetoken_asm", &valid_short, true),
     ];
     assert_eq!(
-        auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
+        session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap().skype_id,
         "short"
     );
     let only_untrusted = vec![cookie(".evil.example", "skypetoken_asm", &untrusted, false)];
-    let err = auth::load_skypetoken(Some(&only_untrusted), Some(NOW_TS)).unwrap_err();
+    let err = session::load_skypetoken(Some(&only_untrusted), Some(NOW_TS)).unwrap_err();
     assert!(err.0.contains("not found"), "{err}");
 
     let cookies = vec![
         cookie(".asm.skype.com", "skypetoken_asm", &expired, false),
         cookie(".asm.skype.com", "skypetoken_asm", "garbage", false),
     ];
-    let err = auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap_err();
+    let err = session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap_err();
     assert!(err.0.contains("expired"), "{err}");
 }
 
@@ -422,14 +427,14 @@ fn display_name_ignores_untrusted_authtoken_hosts() {
         cookie(".evil.example", "authtoken_asm", &evil_auth, false),
         cookie(".asm.skype.com", "authtoken_asm", &good_auth, true),
     ];
-    let t = auth::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap();
+    let t = session::load_skypetoken(Some(&cookies), Some(NOW_TS)).unwrap();
     assert_eq!(t.display_name, "Ada Lovelace");
     let cookies = vec![
         cookie(".asm.skype.com", "skypetoken_asm", &tok, false),
         cookie(".evil.example", "authtoken_asm", &evil_auth, false),
     ];
     assert_eq!(
-        auth::load_skypetoken(Some(&cookies), Some(NOW_TS))
+        session::load_skypetoken(Some(&cookies), Some(NOW_TS))
             .unwrap()
             .display_name,
         ""
@@ -649,14 +654,51 @@ fn send_env() -> SendEnv {
     );
     std::env::set_var("TEAMS_CLI_COOKIES", &db);
     std::env::set_var("TEAMS_CLI_HOME", td.path());
-    std::env::set_var(send::ENABLE_ENV, "1");
-    std::env::remove_var(send::ALLOWLIST_ENV);
+    std::env::set_var(policy::ENABLE_WRITES_ENV, "1");
+    std::env::remove_var(policy::ALLOWLIST_ENV);
     SendEnv { _td: td, token }
 }
 
 fn clear_send_env() {
     std::env::remove_var("TEAMS_CLI_COOKIES");
-    std::env::remove_var(send::ENABLE_ENV);
+    std::env::remove_var(policy::ENABLE_WRITES_ENV);
+}
+
+fn send_via(
+    base: &str,
+    target: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    html: bool,
+    client_message_id: Option<&str>,
+    dry_run: bool,
+) -> Result<Value, teams_cli::live::error::LiveError> {
+    let live = LiveService::new(
+        ServiceEndpoints {
+            chatsvc_base: base.to_string(),
+            ..ServiceEndpoints::default()
+        },
+        false,
+    );
+    live.send_message(
+        ArchiveSource::None,
+        &Principal::cli(),
+        SendMessageRequest {
+            target: target.to_string(),
+            text: text.to_string(),
+            format: if html { BodyFormat::Html } else { BodyFormat::Plain },
+            reply_to: reply_to.map(String::from),
+            quote: None,
+            subject: None,
+            importance: Importance::Normal,
+            mentions: Vec::new(),
+            images: Vec::new(),
+            files: Vec::new(),
+            client_message_id: client_message_id.map(String::from),
+            idempotency_key: None,
+            dry_run,
+        },
+    )
 }
 
 #[test]
@@ -664,7 +706,7 @@ fn send_message_posts_to_mock_chatsvc() {
     let _g = env_lock();
     let env = send_env();
     let (base, seen, h) = mock_chatsvc(201, r#"{"OriginalArrivalTime": 1700000000123}"#, None);
-    let res = send::send_message_via(&base, None, "48:notes", "hi <there>\n\nbye", None, false, None, false).unwrap();
+    let res = send_via(&base, "48:notes", "hi <there>\n\nbye", None, false, None, false).unwrap();
     h.join().unwrap();
     assert_eq!(res["sent"], true);
     assert_eq!(res["status"], 201);
@@ -702,9 +744,8 @@ fn send_message_reply_and_error_statuses() {
     let _env = send_env();
 
     let (base, seen, h) = mock_chatsvc(201, "{}", None);
-    let res = send::send_message_via(
+    let res = send_via(
         &base,
-        None,
         "19:abc@thread.v2",
         "r",
         Some("1795000000001"),
@@ -722,19 +763,19 @@ fn send_message_reply_and_error_statuses() {
     );
 
     let (base, _, h) = mock_chatsvc(401, "{}", None);
-    let err = send::send_message_via(&base, None, "48:notes", "x", None, false, None, false).unwrap_err();
+    let err = send_via(&base, "48:notes", "x", None, false, None, false).unwrap_err();
     h.join().unwrap();
-    assert!(err.0.contains("Authentication failed (HTTP 401)"), "{err}");
+    assert!(err.message.contains("Authentication failed (HTTP 401)"), "{err}");
 
     let (base, _, h) = mock_chatsvc(302, "", Some(("Location", "http://127.0.0.1:1/steal")));
-    let err = send::send_message_via(&base, None, "48:notes", "x", None, false, None, false).unwrap_err();
+    let err = send_via(&base, "48:notes", "x", None, false, None, false).unwrap_err();
     h.join().unwrap();
-    assert!(err.0.contains("refusing to forward credentials"), "{err}");
+    assert!(err.message.contains("refusing to forward credentials"), "{err}");
 
     let (base, _, h) = mock_chatsvc(500, "oops", None);
-    let err = send::send_message_via(&base, None, "48:notes", "x", None, false, None, false).unwrap_err();
+    let err = send_via(&base, "48:notes", "x", None, false, None, false).unwrap_err();
     h.join().unwrap();
-    assert!(err.0.contains("HTTP 500"), "{err}");
+    assert!(err.message.contains("HTTP 500"), "{err}");
 
     for bad in [
         "http://evil.example",
@@ -742,15 +783,14 @@ fn send_message_reply_and_error_statuses() {
         "ftp://127.0.0.1",
         "not a url",
     ] {
-        let err = send::send_message_via(bad, None, "48:notes", "x", None, false, None, false).unwrap_err();
-        assert!(err.0.contains("untrusted chat service"), "{bad}: {err}");
+        let err = send_via(bad, "48:notes", "x", None, false, None, false).unwrap_err();
+        assert!(err.message.contains("untrusted endpoint"), "{bad}: {err}");
     }
 
-    std::env::remove_var(send::ENABLE_ENV);
-    let err =
-        send::send_message_via("http://127.0.0.1:1", None, "48:notes", "x", None, false, None, false).unwrap_err();
-    assert!(err.0.contains("restricted"), "{err}");
-    let dry = send::send_message(None, "48:notes", "x", None, false, None, true).unwrap();
+    std::env::remove_var(policy::ENABLE_WRITES_ENV);
+    let err = send_via("http://127.0.0.1:1", "48:notes", "x", None, false, None, false).unwrap_err();
+    assert!(err.message.contains("restricted"), "{err}");
+    let dry = send_via("https://teams.microsoft.com", "48:notes", "x", None, false, None, true).unwrap();
     assert_eq!(dry["dryRun"], true);
     assert_eq!(dry["sent"], false);
     clear_send_env();
@@ -797,7 +837,25 @@ fn http_rejects_malformed_conflicting_and_oversized_content_length() {
     .unwrap();
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut s, &mut buf).unwrap();
-    assert!(buf.starts_with("HTTP/1.1 413 "), "{buf:?}");
+    assert!(
+        buf.starts_with("HTTP/1.1 401 "),
+        "unauth oversized must fail auth first: {buf:?}"
+    );
+
+    let auth = bearer();
+    let mut s2 = std::net::TcpStream::connect(a).unwrap();
+    s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    std::io::Write::write_all(
+        &mut s2,
+        format!("POST /v1/sync HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth}\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
+    let mut buf2 = String::new();
+    std::io::Read::read_to_string(&mut s2, &mut buf2).unwrap();
+    assert!(
+        buf2.starts_with("HTTP/1.1 413 "),
+        "authed oversized must be 413: {buf2:?}"
+    );
 
     let send_raw = |raw: &[u8]| -> String {
         let mut s = std::net::TcpStream::connect(a).unwrap();

@@ -1,6 +1,6 @@
 use crate::formatters::Quoted;
 use crate::identity;
-use crate::live::onedrive;
+use crate::live::local_onedrive;
 use crate::paths;
 use crate::storage::{archive, backups, db};
 use crate::timeutil::{iso, parse_when};
@@ -1686,7 +1686,7 @@ pub fn attachments(
         .iter()
         .any(|r| r.kind == "file" && r.name.as_deref().map(|s| !s.is_empty()).unwrap_or(false));
     let od_idx = if need_od {
-        Some(onedrive::list_onedrive_files())
+        Some(local_onedrive::list_onedrive_files())
     } else {
         None
     };
@@ -1696,7 +1696,7 @@ pub fn attachments(
             let local_path = if r.kind == "file" {
                 r.name
                     .as_deref()
-                    .and_then(|n| onedrive::find_onedrive_file(n, od_idx.as_ref()))
+                    .and_then(|n| local_onedrive::find_onedrive_file(n, od_idx.as_ref()))
                     .map(|p| p.to_string_lossy().into_owned())
             } else {
                 None

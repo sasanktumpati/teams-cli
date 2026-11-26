@@ -396,7 +396,16 @@ pub fn api_token() -> String {
         }
     }
     let _ = teams_cli::daemon::revoke_named_token("test-harness");
-    let created = teams_cli::daemon::create_named_token("test-harness", None).unwrap();
+    let created = teams_cli::daemon::create_named_token(
+        "test-harness",
+        None,
+        &[
+            teams_cli::live::policy::Scope::Read,
+            teams_cli::live::policy::Scope::Sync,
+        ],
+        None,
+    )
+    .unwrap();
     let tok = created["token"].as_str().unwrap().to_string();
     *guard = Some((home, tok.clone()));
     tok

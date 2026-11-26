@@ -23,6 +23,10 @@ fn main() -> ExitCode {
             }
             ExitCode::from(2)
         }
+        Err(cli::CliError::Live(e)) => {
+            eprintln!("teams: {}", e.message);
+            ExitCode::from(e.cli_exit_code() as u8)
+        }
         Err(cli::CliError::Runtime(msg)) => {
             eprintln!("teams: {msg}");
             ExitCode::from(1)

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use teams_cli::ingest::{extract, indexeddb::TeamsCache, sync, v8};
-use teams_cli::live::{auth, fetch};
+use teams_cli::live::{cookies as auth, fetch};
 use teams_cli::paths;
 use teams_cli::query::{api, views};
 use teams_cli::storage::{archive, backups};

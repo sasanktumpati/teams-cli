@@ -1,7 +1,6 @@
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use base64::Engine;
 use pbkdf2::pbkdf2_hmac;
-use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use sha1::Sha1;
@@ -13,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -28,6 +27,7 @@ const PBKDF2_ITERS: u32 = 1003;
 const AES_IV: [u8; 16] = [b' '; 16];
 const WEBKIT_EPOCH_OFFSET_SEC: f64 = 11_644_473_600.0;
 const COOKIE_COPY_ATTEMPTS: usize = 3;
+const KEYCHAIN_TIMEOUT_SECS: u64 = 15;
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -41,8 +41,7 @@ pub const TRUSTED_HOST_SUFFIXES: &[&str] = &[
     ".microsoftonline.com",
 ];
 
-static REGION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9-]+$").unwrap());
-static KEYCHAIN_CACHE: Mutex<Option<String>> = Mutex::new(None);
+static DERIVED_KEY_CACHE: Mutex<Option<[u8; 16]>> = Mutex::new(None);
 
 #[derive(Debug, Clone)]
 pub struct AuthError(pub String);
@@ -71,28 +70,6 @@ impl fmt::Debug for Cookie {
             .field("name", &self.name)
             .field("path", &self.path)
             .field("partitioned", &self.partitioned)
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct SkypeToken {
-    pub token: String,
-    pub region: String,
-    pub expires_at: f64,
-    pub skype_id: String,
-    pub tenant_id: String,
-    pub display_name: String,
-}
-
-impl fmt::Debug for SkypeToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SkypeToken")
-            .field("region", &self.region)
-            .field("expires_at", &self.expires_at)
-            .field("skype_id", &self.skype_id)
-            .field("tenant_id", &self.tenant_id)
-            .field("display_name", &self.display_name)
             .finish()
     }
 }
@@ -168,12 +145,10 @@ pub fn decrypt_cookie_value(
     String::from_utf8(dec).map_err(|e| AuthError(format!("Decrypted cookie is not valid UTF-8: {e}")))
 }
 
-const KEYCHAIN_TIMEOUT_SECS: u64 = 15;
-
-pub fn get_keychain_password() -> Result<String, AuthError> {
-    if let Ok(guard) = KEYCHAIN_CACHE.lock() {
-        if let Some(ref pw) = *guard {
-            return Ok(pw.clone());
+pub fn get_keychain_aes_key() -> Result<[u8; 16], AuthError> {
+    if let Ok(guard) = DERIVED_KEY_CACHE.lock() {
+        if let Some(k) = *guard {
+            return Ok(k);
         }
     }
     let mut cmd = Command::new("security");
@@ -210,13 +185,20 @@ pub fn get_keychain_password() -> Result<String, AuthError> {
                 .to_string(),
         ));
     }
-    if let Ok(mut guard) = KEYCHAIN_CACHE.lock() {
-        *guard = Some(pw.clone());
+    let key = derive_aes_key(&pw);
+    if let Ok(mut guard) = DERIVED_KEY_CACHE.lock() {
+        *guard = Some(key);
     }
-    Ok(pw)
+    Ok(key)
 }
 
-fn is_expired(expires_utc: i64, now_ts: f64) -> bool {
+pub fn clear_keychain_cache() {
+    if let Ok(mut guard) = DERIVED_KEY_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+pub fn is_expired(expires_utc: i64, now_ts: f64) -> bool {
     if expires_utc <= 0 {
         return false;
     }
@@ -224,7 +206,7 @@ fn is_expired(expires_utc: i64, now_ts: f64) -> bool {
     unix_s <= now_ts
 }
 
-fn now_unix_f64() -> f64 {
+pub fn now_unix_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -346,11 +328,10 @@ pub fn load_cookies(
             let key = match aes_key {
                 Some(k) => k,
                 None => {
-                    let pw = match password {
-                        Some(p) => p.to_string(),
-                        None => get_keychain_password()?,
+                    let k = match password {
+                        Some(p) => derive_aes_key(p),
+                        None => get_keychain_aes_key()?,
                     };
-                    let k = derive_aes_key(&pw);
                     aes_key = Some(k);
                     k
                 }
@@ -388,8 +369,16 @@ pub fn load_cookies(
 
 pub fn decode_jwt_payload(jwt: &str) -> Result<Value, String> {
     let parts: Vec<&str> = jwt.trim().split('.').collect();
-    if parts.len() != 3 || parts[1].is_empty() {
+    if parts.len() != 3 || parts[0].is_empty() || parts[1].is_empty() {
         return Err("not a 3-segment JWT".to_string());
+    }
+    let hdr_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[0]))
+        .map_err(|_| "invalid JWT header base64".to_string())?;
+    let hdr: Value = serde_json::from_slice(&hdr_raw).map_err(|_| "invalid JWT header JSON".to_string())?;
+    if !hdr.is_object() {
+        return Err("JWT header is not a JSON object".to_string());
     }
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -400,42 +389,6 @@ pub fn decode_jwt_payload(jwt: &str) -> Result<Value, String> {
         return Err("JWT payload is not a JSON object".to_string());
     }
     Ok(val)
-}
-
-fn from_trusted_host(c: &Cookie) -> bool {
-    is_trusted_host(Some(c.host_key.trim_start_matches('.')))
-}
-
-fn extract_display_name(cookies: &[Cookie]) -> String {
-    let mut cands: Vec<&Cookie> = cookies
-        .iter()
-        .filter(|c| c.name == "authtoken_asm" && !c.value.trim().is_empty() && from_trusted_host(c))
-        .collect();
-    cands.sort_by_key(|c| c.partitioned);
-    for c in cands {
-        let raw = c.value.trim();
-        let mut jwt_cands = vec![raw.to_string()];
-        let unq = urlencoding_decode(raw);
-        if unq.contains("Bearer=") {
-            for part in unq.split('&') {
-                if let Some(v) = part.strip_prefix("Bearer=") {
-                    if !v.trim().is_empty() {
-                        jwt_cands.push(v.trim().to_string());
-                    }
-                }
-            }
-        }
-        for cand in jwt_cands {
-            if let Ok(payload) = decode_jwt_payload(&cand) {
-                if let Some(name) = payload.get("name").and_then(|v| v.as_str()).map(str::trim) {
-                    if !name.is_empty() {
-                        return name.to_string();
-                    }
-                }
-            }
-        }
-    }
-    String::new()
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -465,102 +418,6 @@ pub fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn load_skypetoken(cookies_opt: Option<&[Cookie]>, now_opt: Option<f64>) -> Result<SkypeToken, AuthError> {
-    let now_ts = now_opt.unwrap_or_else(now_unix_f64);
-    let owned: Vec<Cookie>;
-    let loaded: &[Cookie] = match cookies_opt {
-        Some(c) => c,
-        None => {
-            owned = load_cookies(None, None, Some(now_ts))?;
-            &owned
-        }
-    };
-    let mut cands: Vec<&Cookie> = loaded
-        .iter()
-        .filter(|c| c.name == "skypetoken_asm" && !c.value.trim().is_empty() && from_trusted_host(c))
-        .collect();
-    if cands.is_empty() {
-        return Err(AuthError(
-            "Teams session token (skypetoken_asm) not found. \
-             Open Microsoft Teams and sign in, then try again."
-                .to_string(),
-        ));
-    }
-    cands.sort_by_key(|c| c.partitioned);
-    let mut best: Option<(bool, SkypeToken)> = None;
-    let mut first_err: Option<AuthError> = None;
-    for c in cands {
-        match parse_skypetoken(c.value.trim(), now_ts) {
-            Ok(tok) => {
-                let better = match &best {
-                    None => true,
-                    Some((bp, bt)) => (c.partitioned, -tok.expires_at) < (*bp, -bt.expires_at),
-                };
-                if better {
-                    best = Some((c.partitioned, tok));
-                }
-            }
-            Err(e) => {
-                first_err.get_or_insert(e);
-            }
-        }
-    }
-    match best {
-        Some((_, mut tok)) => {
-            tok.display_name = extract_display_name(loaded);
-            Ok(tok)
-        }
-        None => {
-            Err(first_err.unwrap_or_else(|| AuthError("Teams session token (skypetoken_asm) not found.".to_string())))
-        }
-    }
-}
-
-fn parse_skypetoken(raw_token: &str, now_ts: f64) -> Result<SkypeToken, AuthError> {
-    let payload = decode_jwt_payload(raw_token).map_err(|_| {
-        AuthError(
-            "Teams session token (skypetoken_asm) is malformed. \
-             Open Microsoft Teams to refresh your session, then try again."
-                .to_string(),
-        )
-    })?;
-    let region = payload
-        .get("rgn")
-        .and_then(|v| v.as_str())
-        .filter(|r| REGION_RE.is_match(r))
-        .ok_or_else(|| AuthError("Teams session token has an invalid or missing region claim.".to_string()))?
-        .to_string();
-    let exp = payload
-        .get("exp")
-        .and_then(|v| if v.is_boolean() { None } else { v.as_f64() })
-        .ok_or_else(|| {
-            AuthError(
-                "Teams session token has an invalid or missing expiration claim. \
-                 Open Microsoft Teams to refresh your session, then try again."
-                    .to_string(),
-            )
-        })?;
-    if exp <= now_ts {
-        return Err(AuthError(
-            "Teams session token has expired. \
-             Open Microsoft Teams to refresh your session, then try again."
-                .to_string(),
-        ));
-    }
-    Ok(SkypeToken {
-        token: raw_token.to_string(),
-        region,
-        expires_at: exp,
-        skype_id: payload
-            .get("skypeid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        tenant_id: payload.get("tid").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        display_name: String::new(),
-    })
-}
-
 pub fn is_trusted_host(host: Option<&str>) -> bool {
     let h = host.unwrap_or("").trim().to_ascii_lowercase();
     let h = h.trim_end_matches('.');
@@ -587,6 +444,10 @@ pub fn is_login_host(host: Option<&str>) -> bool {
     let h = host.unwrap_or("").trim().to_ascii_lowercase();
     let h = h.trim_end_matches('.');
     h == "login.microsoftonline.com" || h == "login.live.com" || h.ends_with(".login.microsoftonline.com")
+}
+
+pub fn cookie_matches_host(host_key: &str, req_host: &str) -> bool {
+    domain_matches(host_key, req_host)
 }
 
 fn domain_matches(host_key: &str, req_host: &str) -> bool {
