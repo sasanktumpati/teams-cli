@@ -685,18 +685,28 @@ fn named_tokens_create_expiry_revoke_and_prune_live() {
 
 #[test]
 fn concurrent_post_sync_returns_409_busy_immediately() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let release_rx = Mutex::new(release_rx);
     let f = Fixture::new(Some(SyncConfig {
-        runner: Arc::new(|_| {
-            std::thread::sleep(Duration::from_millis(350));
+        runner: Arc::new(move |_| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
             Ok(json!({"messages_new": 1}))
         }),
         interval: None,
     }));
     let addr = f.addr();
     let t1 = std::thread::spawn(move || raw_request(addr, "POST", "/v1/sync", &[]).status);
-    std::thread::sleep(Duration::from_millis(40));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first sync did not start in time");
     let t2 = raw_request(addr, "POST", "/v1/sync", &[]);
     assert_eq!((t2.status, t2.body["error"]["code"].as_str()), (409, Some("sync_busy")));
+    let _ = release_tx.send(());
     assert_eq!(t1.join().unwrap(), 200);
 }
 
