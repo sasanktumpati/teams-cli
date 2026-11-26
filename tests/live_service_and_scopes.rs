@@ -247,7 +247,7 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
     std::env::set_var("TEAMS_CLI_ENABLE_WRITES", "1");
     std::env::remove_var("TEAMS_CLI_WRITE_ALLOWLIST");
 
-    let (base, seen, h) = mock_upstream(19, |req| {
+    let (base, seen, h) = mock_upstream(22, |req| {
         if req.url == "/v1/objects" && req.method == "POST" {
             return (201, vec![], r#"{"id":"0-ams-img-1"}"#.to_string());
         }
@@ -291,6 +291,13 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
                 200,
                 vec![],
                 r#"{"availability":"Available","activity":"Available"}"#.to_string(),
+            );
+        }
+        if req.url.ends_with("/messages/forward") && req.method == "POST" {
+            return (
+                200,
+                vec![],
+                r#"[{"statusCode":200,"messageId":"1799999999555"}]"#.to_string(),
             );
         }
         if req.url.contains("/messages") && req.method == "POST" {
@@ -375,6 +382,20 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
         .unwrap();
     assert_eq!(pin["pinned"], true);
 
+    let unpin = live
+        .pin_message(
+            ArchiveSource::Conn(&conn),
+            &cli_p,
+            MessageActionRequest {
+                chat: None,
+                message_id: format!("{GROUP}/{MID}"),
+                dry_run: false,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(unpin["pinned"], false);
+
     let save = live
         .save_message(
             ArchiveSource::Conn(&conn),
@@ -388,6 +409,20 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
         )
         .unwrap();
     assert_eq!(save["saved"], true);
+
+    let unsave = live
+        .save_message(
+            ArchiveSource::Conn(&conn),
+            &cli_p,
+            MessageActionRequest {
+                chat: None,
+                message_id: format!("{GROUP}/{MID}"),
+                dry_run: false,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(unsave["saved"], false);
 
     let fwd = live
         .forward_message(
@@ -405,6 +440,7 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
         )
         .unwrap();
     assert_eq!(fwd["forwarded"], true);
+    assert_eq!(fwd["messageId"], "1799999999555");
 
     let err_other_author = live
         .edit_message(
@@ -483,13 +519,14 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
     let pres = live.get_presence(ArchiveSource::None, &cli_p, &[]).unwrap();
     assert_eq!(pres["availability"], "Available");
     let _ = live.set_presence(&cli_p, "dnd", Some("1h"), false).unwrap();
+    let _ = live.set_presence(&cli_p, "reset", None, false).unwrap();
     let _ = live
         .set_status_message(&cli_p, Some("Heads down"), false, Some("2h"), false)
         .unwrap();
 
     h.join().unwrap();
     let recorded = seen.lock().unwrap();
-    assert_eq!(recorded.len(), 19);
+    assert_eq!(recorded.len(), 22);
     let ams_create = recorded.iter().find(|r| r.url == "/v1/objects").unwrap();
     assert!(ams_create
         .headers
@@ -515,6 +552,31 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
         .unwrap();
     assert!(chat_send.body.contains("0-ams-img-1"));
     assert!(chat_send.body.contains("sp-guid-99"));
+    let fwd_req = recorded
+        .iter()
+        .find(|r| r.method == "POST" && r.url.ends_with("/messages/forward"))
+        .unwrap();
+    assert!(fwd_req.body.contains("basic_forward_message_template"));
+    assert!(fwd_req.body.contains("48:notes"));
+    let unpin_req = recorded
+        .iter()
+        .find(|r| r.method == "DELETE" && r.url.contains("properties?name=pinned"))
+        .unwrap();
+    assert!(unpin_req.body.contains("\"pinned\""));
+    let rcm_reqs: Vec<&RecordedReq> = recorded
+        .iter()
+        .filter(|r| r.method == "PUT" && r.url.contains("/rcmetadata/"))
+        .collect();
+    assert_eq!(rcm_reqs.len(), 2);
+    assert_eq!(serde_json::from_str::<Value>(&rcm_reqs[0].body).unwrap()["s"], 1);
+    assert_eq!(serde_json::from_str::<Value>(&rcm_reqs[1].body).unwrap()["s"], 0);
+    let force_avail: Vec<&RecordedReq> = recorded
+        .iter()
+        .filter(|r| r.method == "PUT" && r.url == "/v1/me/forceavailability/")
+        .collect();
+    assert_eq!(force_avail.len(), 2);
+    assert!(force_avail[0].body.contains("DoNotDisturb") && !force_avail[0].body.contains("activity"));
+    assert!(force_avail[1].body.is_empty());
 
     let audit = std::fs::read_to_string(home.join("write-audit.jsonl")).unwrap();
     assert!(audit.contains("message.send"));

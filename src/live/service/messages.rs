@@ -862,12 +862,39 @@ impl LiveService {
         self.check_write_rate_limit(principal, Action::ForwardMessage)?;
 
         let tok = self.session.skypetoken()?;
-        let mut payload = composed.payload;
-        if payload["imdisplayname"].as_str().unwrap_or("").is_empty() && !tok.display_name.is_empty() {
-            payload["imdisplayname"] = Value::String(tok.display_name.clone());
-        }
-        let (status, new_msg_id) =
-            self.track_upstream(chatsvc::send_message(&self.transport, &tok, &dest.id, None, &payload))?;
+        let comment_html = if req.comment.trim().is_empty() {
+            String::new()
+        } else {
+            match req.format {
+                BodyFormat::Plain => compose::format_plain_html(&req.comment),
+                BodyFormat::Markdown => compose::render_markdown_to_teams_html(&req.comment),
+                BodyFormat::Html => req.comment.clone(),
+            }
+        };
+        let eff_display = if composed.payload["imdisplayname"].as_str().unwrap_or("").is_empty() {
+            tok.display_name.clone()
+        } else {
+            composed.payload["imdisplayname"].as_str().unwrap_or("").to_string()
+        };
+        let additional_msg = json!({
+            "content": comment_html,
+            "messagetype": "RichText/Html",
+            "contenttype": "text",
+            "clientmessageid": composed.client_message_id,
+            "imdisplayname": eff_display,
+            "composetime": composed.payload["composetime"],
+            "properties": {
+                "formatVariant": "TEAMS",
+            },
+        });
+        let (status, new_msg_id) = self.track_upstream(chatsvc::forward_message(
+            &self.transport,
+            &tok,
+            &src.conversation_id,
+            &src.message_id,
+            &dest.id,
+            &additional_msg,
+        ))?;
 
         let hash = policy::content_sha256_hex(&composed.content_html);
         policy::append_audit_entry(

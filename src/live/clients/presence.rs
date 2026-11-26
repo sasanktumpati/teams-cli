@@ -39,8 +39,10 @@ pub fn set_availability(
     let auth = bearer_header(tok);
     let mut payload = json!({
         "availability": availability,
-        "activity": activity,
     });
+    if availability == "Offline" && !activity.is_empty() {
+        payload["activity"] = Value::String(activity.to_string());
+    }
     if let Some(exp) = expiry_iso {
         payload["desiredExpirationTime"] = Value::String(exp.to_string());
     }
@@ -51,7 +53,14 @@ pub fn set_availability(
 pub fn reset_availability(transport: &Transport, tok: &TeamsBearerToken) -> Result<u16, LiveError> {
     let url = format!("{}/v1/me/forceavailability/", base(transport));
     let auth = bearer_header(tok);
-    let resp = transport.request_json("DELETE", &url, &[("Authorization", &auth)], None, &[&tok.token])?;
+    let resp = transport.request_bytes(
+        "PUT",
+        &url,
+        &[("Authorization", &auth), ("Content-Type", "application/json")],
+        Some(b""),
+        &[&tok.token],
+        crate::live::transport::WRITE_TIMEOUT,
+    )?;
     Ok(resp.status)
 }
 

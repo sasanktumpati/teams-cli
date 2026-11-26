@@ -117,6 +117,78 @@ pub fn set_reaction(
     Ok(resp.status)
 }
 
+pub fn forward_message(
+    transport: &Transport,
+    tok: &SkypeToken,
+    source_conv_id: &str,
+    source_message_id: &str,
+    dest_conv_id: &str,
+    additional_message: &Value,
+) -> Result<(u16, Option<String>), LiveError> {
+    let conv_seg = percent_encode_conv(source_conv_id);
+    let url = format!(
+        "{}/users/ME/conversations/{conv_seg}/messages/forward",
+        chatsvc_base(transport, &tok.region)
+    );
+    let payload = json!({
+        "targetThreadIds": [dest_conv_id],
+        "messageIds": [source_message_id],
+        "additionalMessage": additional_message,
+        "templateId": "basic_forward_message_template",
+    });
+    let auth = auth_header(tok);
+    let resp = transport.request_json(
+        "POST",
+        &url,
+        &[("Authentication", &auth)],
+        Some(&payload),
+        &[&tok.token],
+    )?;
+    let parsed = resp.json();
+    if let Some(arr) = parsed.as_ref().and_then(Value::as_array) {
+        if let Some(first) = arr.first() {
+            let inner_status = first.get("statusCode").and_then(Value::as_u64).unwrap_or(200);
+            if !(200..=299).contains(&inner_status) || first.get("error").is_some_and(|e| !e.is_null()) {
+                let err_detail = first
+                    .get("error")
+                    .map(crate::json_codec::to_string)
+                    .unwrap_or_else(|| format!("HTTP {inner_status}"));
+                return Err(LiveError::upstream(format!(
+                    "Teams rejected forwarded message: {err_detail}"
+                )));
+            }
+            let msg_id = first
+                .get("messageId")
+                .or_else(|| first.get("OriginalArrivalTime"))
+                .or_else(|| first.get("originalArrivalTime"))
+                .and_then(|v| {
+                    if v.is_null() || v.is_boolean() {
+                        None
+                    } else if let Some(s) = v.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        Some(v.to_string())
+                    }
+                });
+            return Ok((inner_status as u16, msg_id));
+        }
+    }
+    let msg_id = parsed.and_then(|v| {
+        let oat = v
+            .get("messageId")
+            .or_else(|| v.get("OriginalArrivalTime"))
+            .or_else(|| v.get("originalArrivalTime"))?;
+        if oat.is_boolean() || oat.is_null() {
+            None
+        } else if let Some(s) = oat.as_str() {
+            Some(s.to_string())
+        } else {
+            Some(oat.to_string())
+        }
+    });
+    Ok((resp.status, msg_id))
+}
+
 pub fn set_pinned(transport: &Transport, tok: &SkypeToken, target: &MessageRef, pin: bool) -> Result<u16, LiveError> {
     let conv_seg = target.conversation_segment();
     let msg_seg = percent_encode_segment(&target.message_id);
@@ -126,38 +198,33 @@ pub fn set_pinned(transport: &Transport, tok: &SkypeToken, target: &MessageRef, 
     );
     let auth = auth_header(tok);
     let (method, body) = if pin {
-        ("PUT", Some(json!({ "pinned": true })))
+        ("PUT", json!({ "pinned": true }))
     } else {
-        ("DELETE", None)
+        ("DELETE", json!({ "pinned": Value::Null }))
     };
-    let resp = transport.request_json(method, &url, &[("Authentication", &auth)], body.as_ref(), &[&tok.token])?;
+    let resp = transport.request_json(method, &url, &[("Authentication", &auth)], Some(&body), &[&tok.token])?;
     Ok(resp.status)
 }
 
 pub fn set_saved(transport: &Transport, tok: &SkypeToken, target: &MessageRef, save: bool) -> Result<u16, LiveError> {
-    let conv_seg = percent_encode_conv("48:saved");
-    let msg_seg = percent_encode_segment(&target.message_id);
+    let conv_seg = percent_encode_conv(&target.conversation_id);
+    let root_id = target.thread_root.as_deref().unwrap_or(&target.message_id);
+    let root_seg = percent_encode_segment(root_id);
     let url = format!(
-        "{}/users/ME/conversations/{conv_seg}/messages/{msg_seg}",
+        "{}/users/ME/conversations/{conv_seg}/rcmetadata/{root_seg}",
         chatsvc_base(transport, &tok.region)
     );
+    let mid_val: Value = target
+        .message_id
+        .parse::<i64>()
+        .map(Value::from)
+        .unwrap_or_else(|_| Value::String(target.message_id.clone()));
+    let body = json!({
+        "s": if save { 1 } else { 0 },
+        "mid": mid_val,
+    });
     let auth = auth_header(tok);
-    let (method, body) = if save {
-        (
-            "PUT",
-            Some(json!({
-                "id": target.message_id,
-                "conversationid": target.conversation_id,
-                "properties": {
-                    "sourceConversationId": target.conversation_id,
-                    "sourceMessageId": target.message_id,
-                }
-            })),
-        )
-    } else {
-        ("DELETE", None)
-    };
-    let resp = transport.request_json(method, &url, &[("Authentication", &auth)], body.as_ref(), &[&tok.token])?;
+    let resp = transport.request_json("PUT", &url, &[("Authentication", &auth)], Some(&body), &[&tok.token])?;
     Ok(resp.status)
 }
 
