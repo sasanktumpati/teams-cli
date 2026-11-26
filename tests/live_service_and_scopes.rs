@@ -211,6 +211,8 @@ fn compose_markdown_escapes_html_and_builds_mentions_quotes_media() {
     assert!(composed.content_html.contains("http://schema.skype.com/Mention"));
     assert!(composed.content_html.contains("Ada &lt;Boss&gt;"));
     assert!(composed.content_html.contains("http://schema.skype.com/AMSImage"));
+    assert!(composed.content_html.contains("itemid=\"0-wus-d1-abc\""));
+    assert!(composed.content_html.contains("id=\"x_0-wus-d1-abc\""));
     assert!(composed
         .content_html
         .contains("<attachment id=\"guid-123\"></attachment>"));
@@ -493,6 +495,14 @@ fn live_service_uploads_image_and_file_and_executes_all_actions() {
         .headers
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("Authorization") && v.starts_with("skype_token ")));
+    assert!(ams_create
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("User-Agent") && v.starts_with("Teams/")));
+    assert!(ams_create
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("X-Client-Version") && v.starts_with("1415/")));
     assert!(ams_create.body.contains("pish/image"));
     let sp_upload = recorded.iter().find(|r| r.url.contains("/Files/add(")).unwrap();
     assert!(sp_upload
@@ -1606,4 +1616,39 @@ fn get_presence_validates_people_before_fetching_bearer_token() {
         "invalid person must fail with 404 before bearer token lookup: {:?}",
         err
     );
+}
+
+#[test]
+fn transport_allows_regional_subdomain_redirects_and_blocks_unsafe_targets() {
+    use teams_cli::live::transport::is_safe_regional_redirect;
+
+    let allowed = is_safe_regional_redirect(
+        "https://presence.teams.microsoft.com/v1/me/presence",
+        "https://noam.presence.teams.microsoft.com/v1/me/presence",
+    );
+    assert_eq!(
+        allowed.as_deref(),
+        Some("https://noam.presence.teams.microsoft.com/v1/me/presence")
+    );
+
+    assert!(is_safe_regional_redirect(
+        "https://presence.teams.microsoft.com/v1/me/presence",
+        "https://login.microsoftonline.com/common/oauth2/authorize",
+    )
+    .is_none());
+    assert!(is_safe_regional_redirect(
+        "https://presence.teams.microsoft.com/v1/me/presence",
+        "https://evil.example/v1/me/presence",
+    )
+    .is_none());
+    assert!(is_safe_regional_redirect(
+        "https://presence.teams.microsoft.com/v1/me/presence",
+        "http://noam.presence.teams.microsoft.com/v1/me/presence",
+    )
+    .is_none());
+    assert!(is_safe_regional_redirect(
+        "https://contoso-my.sharepoint.com/_api/contextinfo",
+        "https://contoso.sharepoint.com/_api/contextinfo",
+    )
+    .is_none());
 }

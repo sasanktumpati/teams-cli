@@ -54,6 +54,30 @@ pub fn is_allowed_endpoint_url(url_str: &str) -> bool {
     })
 }
 
+pub fn is_safe_regional_redirect(orig_url: &str, location: &str) -> Option<String> {
+    let orig = Url::parse(orig_url).ok()?;
+    let next = orig.join(location).ok()?;
+    let next_str = next.as_str();
+    if !orig.scheme().eq_ignore_ascii_case("https")
+        || !next.scheme().eq_ignore_ascii_case("https")
+        || next.port_or_known_default() != Some(443)
+        || !is_allowed_endpoint_url(next_str)
+    {
+        return None;
+    }
+    let orig_host = orig.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let next_host = next.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if cookies::is_login_host(Some(&next_host)) {
+        return None;
+    }
+    if !next_host.ends_with(&format!(".{orig_host}")) {
+        return None;
+    }
+    Some(next_str.to_string())
+}
+
+const MAX_REGIONAL_REDIRECTS: usize = 2;
+
 pub fn validate_endpoint_url(url_str: &str) -> Result<(), LiveError> {
     if !is_allowed_endpoint_url(url_str) {
         return Err(LiveError::bad(format!(
@@ -120,63 +144,85 @@ impl Transport {
     ) -> Result<HttpResponse, LiveError> {
         validate_endpoint_url(url)?;
         let ag = self.get_agent(timeout);
-        let mut req = ag.request(method, url).set("User-Agent", cookies::USER_AGENT);
-        for (k, v) in headers {
-            req = req.set(k, v);
-        }
-        let resp = match body {
-            Some(bytes) => {
-                req = req.set("Content-Length", &bytes.len().to_string());
-                req.send_bytes(bytes)
+        let mut current_url = url.to_string();
+        for hop in 0..=MAX_REGIONAL_REDIRECTS {
+            let mut req = ag.request(method, &current_url);
+            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("User-Agent")) {
+                req = req.set("User-Agent", cookies::USER_AGENT);
             }
-            None => req.call(),
-        };
-        let (status, location, raw_body) = match resp {
-            Ok(r) => {
-                let st = r.status();
-                let loc = r.header("Location").map(String::from);
-                let mut buf = String::new();
-                let _ = r.into_reader().take(2 * 1024 * 1024).read_to_string(&mut buf);
-                (st, loc, buf)
+            for (k, v) in headers {
+                req = req.set(k, v);
             }
-            Err(ureq::Error::Status(code, r)) => {
-                if matches!(code, 301 | 302 | 303 | 307 | 308) {
-                    return Err(LiveError::upstream(
-                        "Unexpected redirect from Microsoft service; refusing to forward credentials.",
-                    ));
+            let resp = match body {
+                Some(bytes) => {
+                    req = req.set("Content-Length", &bytes.len().to_string());
+                    req.send_bytes(bytes)
                 }
-                if matches!(code, 401 | 403) {
-                    return Err(LiveError::auth(format!(
-                        "Authentication failed (HTTP {code}). Open Microsoft Teams to refresh your session, then try again."
-                    )));
+                None => req.call(),
+            };
+            let (status, location, raw_body) = match resp {
+                Ok(r) => {
+                    let st = r.status();
+                    let loc = r.header("Location").map(String::from);
+                    let mut buf = String::new();
+                    let _ = r.into_reader().take(2 * 1024 * 1024).read_to_string(&mut buf);
+                    (st, loc, buf)
                 }
-                let mut err_body = String::new();
-                let _ = r.into_reader().take(512).read_to_string(&mut err_body);
-                let safe_body = redact_secrets(err_body.trim(), secrets);
-                let detail = if safe_body.is_empty() {
-                    format!("Microsoft service request failed (HTTP {code}).")
-                } else {
-                    format!("Microsoft service request failed (HTTP {code}): {safe_body}")
-                };
-                return Err(LiveError::upstream(detail));
-            }
-            Err(ureq::Error::Transport(t)) => {
-                let reason = redact_secrets(&t.to_string(), secrets);
-                return Err(LiveError::upstream(format!("Request failed: {reason}")));
-            }
-        };
+                Err(ureq::Error::Status(code, r)) => {
+                    if matches!(code, 301 | 302 | 303 | 307 | 308) {
+                        let loc = r.header("Location").map(String::from);
+                        (code, loc, String::new())
+                    } else if matches!(code, 401 | 403) {
+                        return Err(LiveError::auth(format!(
+                            "Authentication failed (HTTP {code}). Open Microsoft Teams to refresh your session, then try again."
+                        )));
+                    } else {
+                        let mut err_body = String::new();
+                        let _ = r.into_reader().take(512).read_to_string(&mut err_body);
+                        let safe_body = redact_secrets(err_body.trim(), secrets);
+                        let detail = if safe_body.is_empty() {
+                            format!("Microsoft service request failed (HTTP {code}).")
+                        } else {
+                            format!("Microsoft service request failed (HTTP {code}): {safe_body}")
+                        };
+                        return Err(LiveError::upstream(detail));
+                    }
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    let reason = redact_secrets(&t.to_string(), secrets);
+                    return Err(LiveError::upstream(format!("Request failed: {reason}")));
+                }
+            };
 
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            return Err(LiveError::upstream(
-                "Unexpected redirect from Microsoft service; refusing to forward credentials.",
-            ));
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if hop < MAX_REGIONAL_REDIRECTS && matches!(status, 301 | 302 | 307 | 308) {
+                    if let Some(ref loc) = location {
+                        if let Some(next_url) = is_safe_regional_redirect(url, loc) {
+                            current_url = next_url;
+                            continue;
+                        }
+                    }
+                }
+                let target_hint = location
+                    .as_deref()
+                    .and_then(|l| Url::parse(l).ok())
+                    .and_then(|u| u.host_str().map(|h| format!(" ({status} -> {h}{})", u.path())))
+                    .unwrap_or_else(|| format!(" (HTTP {status})"));
+                return Err(LiveError::upstream(format!(
+                    "Unexpected redirect{target_hint} from Microsoft service; refusing to forward credentials."
+                )));
+            }
+
+            return Ok(HttpResponse {
+                status,
+                body: raw_body,
+                location,
+            });
         }
 
-        Ok(HttpResponse {
-            status,
-            body: raw_body,
-            location,
-        })
+        Err(LiveError::upstream(
+            "Too many redirects from Microsoft service; refusing to forward credentials.",
+        ))
     }
 
     pub fn request_json(

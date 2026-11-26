@@ -464,10 +464,21 @@ pub fn compose_message(input: &ComposeInput) -> Result<ComposedPayload, LiveErro
 
     let mut ams_refs = Vec::new();
     for img in &input.images {
+        let ext = img
+            .content_type
+            .split('/')
+            .nth(1)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "png".to_string());
+        let esc_id = html_escape(&img.object_id);
         content.push_str(&format!(
-            "<p><img src=\"{}\" itemscope itemtype=\"http://schema.skype.com/AMSImage\" alt=\"{}\" /></p>",
+            "<p><img src=\"{}\" itemtype=\"http://schema.skype.com/AMSImage\" itemscope=\"{}\" alt=\"{}\" id=\"x_{}\" itemid=\"{}\" /></p>",
             html_escape(&img.imgo_url),
-            html_escape(&img.filename)
+            html_escape(&ext),
+            html_escape(&img.filename),
+            esc_id,
+            esc_id
         ));
         ams_refs.push(Value::String(img.object_id.clone()));
     }

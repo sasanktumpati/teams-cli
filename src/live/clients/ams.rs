@@ -5,6 +5,8 @@ use crate::live::transport::{Transport, WRITE_TIMEOUT};
 use serde_json::json;
 
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const AMS_CLIENT_VERSION: &str = "1415/26304.1206.5384.1209";
+const AMS_USER_AGENT: &str = "Teams/26304.1206.5384.1209";
 
 pub fn upload_image(
     transport: &Transport,
@@ -38,7 +40,11 @@ pub fn upload_image(
     let resp = transport.request_json(
         "POST",
         &create_url,
-        &[("Authorization", &auth), ("X-Client-Version", "teams-cli")],
+        &[
+            ("Authorization", &auth),
+            ("User-Agent", AMS_USER_AGENT),
+            ("X-Client-Version", AMS_CLIENT_VERSION),
+        ],
         Some(&create_payload),
         &[&tok.token],
     )?;
@@ -53,7 +59,12 @@ pub fn upload_image(
     let _ = transport.request_bytes(
         "PUT",
         &upload_url,
-        &[("Authorization", &auth), ("Content-Type", content_type)],
+        &[
+            ("Authorization", &auth),
+            ("User-Agent", AMS_USER_AGENT),
+            ("X-Client-Version", AMS_CLIENT_VERSION),
+            ("Content-Type", content_type),
+        ],
         Some(bytes),
         &[&tok.token],
         WRITE_TIMEOUT,
